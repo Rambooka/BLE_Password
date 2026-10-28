@@ -49,6 +49,19 @@ west build -b nrf52840dk/nrf52840     -d build_mdbt50q  -p always --sysbuild .
 ```
 Outputs per build dir: `dfu_application.zip` (signed app + manifest = BLE update package, bundled into the Android app), `merged.hex` (MCUboot + app, for J-Link), `BLE_Password/zephyr/zephyr.signed.bin`. Dongle build also makes `dongle_mcuboot_migration.zip` (Nordic-bootloader package containing **only MCUboot**). Version comes from `VERSION` (currently 1.1.6) → shown in the app and in the status dump. **Always bump it for a new image**: the app's updater silently skips the upload if the dongle already runs an image with the same hash, and two different images with the same version can't be told apart.
 
+**Lint — run after EVERY code change (firmware or app), before committing:**
+```
+powershell -ExecutionPolicy Bypass -File tools\lint.ps1             # both
+powershell -ExecutionPolicy Bypass -File tools\lint.ps1 -Firmware   # after a west build of both boards
+powershell -ExecutionPolicy Bypass -File tools\lint.ps1 -Android [-AndroidDir <app dir>]
+```
+- **Firmware = clang-tidy** (`C:\Program Files\LLVM\bin\clang-tidy.exe`, LLVM 18) on `src/*.c`, for **both** boards (main.c has board `#ifdef`s). The script reuses each build's `compile_commands.json`, strips GCC-only flags and adds `--target=arm-none-eabi`, so build first. Checks are in `.clang-tidy`: bugprone/cert/clang-analyzer/misc, with Zephyr noise off and the reason given for each. Target: **zero findings**. Fix real issues. Silence false positives with a targeted `NOLINTNEXTLINE(check): reason` (as on the `K_THREAD_DEFINE` lines), not by disabling checks globally.
+- **App = Android Lint** (`gradlew :app:lintRelease`, report `app\build\reports\lint-results-release.html`). Target: **zero errors** (errors fail the task). Don't add new warnings. Known existing warnings (2026-10-29): dependency upgrades, `OldTargetApi`, unused template colours and the Baking sample's images, `UseKtx`/`UseTomlInstead`/`RedundantLabel` style. Upgrading dependencies is a separate, deliberate change, not a lint fix.
+- The `-AndroidDir` default is `..\android` (the planned in-repo location). Until the move, pass `-AndroidDir C:\Users\rabram\Source\Android\BLE_Beacon`.
+- First run (2026-10-29) found and fixed:
+  - firmware: 4× `strcpy` → size-asserted `memcpy`, RSSI sum `int16_t` → `int32_t`;
+  - app: the API 33+ `writeCharacteristic` result was compared to `GATT_SUCCESS` instead of `BluetoothStatusCodes.SUCCESS` (both 0, so it worked by luck); `remember { purgeSecrets() }` → `LaunchedEffect`.
+
 **Release flow:** bump `VERSION` → build both boards → build the Android app (it copies both `dfu_application.zip` in) → users update from the app.
 
 **Official dongle — ONE-TIME migration to MCUboot** (`flash_dongle.bat`):

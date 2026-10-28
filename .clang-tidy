@@ -1,0 +1,22 @@
+# clang-tidy config for the firmware (run via tools\lint.ps1).
+# Bug-finding checks only; the Zephyr-idiom noise is switched off below.
+Checks: >
+  -*,
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  misc-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-reserved-identifier,
+  -cert-dcl37-c,
+  -cert-dcl51-cpp,
+  -misc-include-cleaner,
+  -misc-unused-parameters,
+  -cert-err33-c,
+  -clang-analyzer-deadcode.DeadStores
+# cert-err33-c: flags every unchecked snprintf; ours write status lines into
+#   fixed buffers where truncation is harmless and there is no error path.
+# DeadStores: the dongle build has CONFIG_LOG=n, so a value used only by a
+#   LOG_*() call (e.g. a flash rc) looks dead.
+HeaderFilterRegex: '.*[/\\]BLE_Password[/\\]src[/\\].*'
+WarningsAsErrors: ''

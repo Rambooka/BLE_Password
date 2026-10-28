@@ -253,7 +253,7 @@ static int8_t rssi_avg_update(int8_t sample)
 		rssi_count++;
 	}
 
-	int16_t sum = 0;
+	int32_t sum = 0;
 	for (uint8_t i = 0; i < rssi_count; i++) {
 		sum += rssi_buf[i];
 	}
@@ -650,14 +650,20 @@ static void config_load_from_flash(void)
 		return;
 	}
 
+	/* Record fields and live buffers are the same size, so a terminated
+	 * whole-buffer copy is bounded by construction. */
+	BUILD_ASSERT(sizeof(password_str) == sizeof(cfg.password));
+	BUILD_ASSERT(sizeof(target_beacon_name) == sizeof(cfg.beacon));
+	BUILD_ASSERT(sizeof(password2_str) == sizeof(cfg.password2));
+	BUILD_ASSERT(sizeof(username2_str) == sizeof(cfg.username2));
 	cfg.password[PASSWORD_MAX_LEN] = '\0';
 	cfg.beacon[BEACON_NAME_MAX_LEN] = '\0';
 	cfg.password2[PASSWORD_MAX_LEN] = '\0';
 	cfg.username2[PASSWORD_MAX_LEN] = '\0';
-	strcpy(password_str, cfg.password);
-	strcpy(target_beacon_name, cfg.beacon);
-	strcpy(password2_str, cfg.password2);
-	strcpy(username2_str, cfg.username2);
+	memcpy(password_str, cfg.password, sizeof(password_str));
+	memcpy(target_beacon_name, cfg.beacon, sizeof(target_beacon_name));
+	memcpy(password2_str, cfg.password2, sizeof(password2_str));
+	memcpy(username2_str, cfg.username2, sizeof(username2_str));
 	rssi_green_threshold = cfg.green;
 	rssi_blue_threshold = cfg.blue;
 
@@ -1305,6 +1311,7 @@ static void type_thread_fn(void *a, void *b, void *c)
 	}
 }
 
+/* NOLINTNEXTLINE(bugprone-branch-clone,misc-misplaced-const): Zephyr macro internals */
 K_THREAD_DEFINE(type_tid, 1024, type_thread_fn, NULL, NULL, NULL, 7, 0, 0);
 
 /* ---- Fatal error indicator --------------------------------------------- */
@@ -1491,6 +1498,7 @@ static void ble_init_thread_fn(void *a, void *b, void *c)
 	LOG_INF("BLE Password initialized — scanning for '%s'", target_beacon_name);
 }
 
+/* NOLINTNEXTLINE(bugprone-branch-clone,misc-misplaced-const): Zephyr macro internals */
 K_THREAD_DEFINE(ble_init_tid, 2048, ble_init_thread_fn, NULL, NULL, NULL,
 		7, 0, 0);
 
