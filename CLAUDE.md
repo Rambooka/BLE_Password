@@ -170,6 +170,7 @@ Compose UI: Password (short press), Username 2 + Password 2 (1-second press, opt
   - Firmware loads only v6 records. The app connects only to "held" dongles, needs minSdk 26, and dropped `purgeSecrets` and the beacon-name pref.
   - BLE update 1.2.0 → 1.2.1 from the new app worked.
   - Dump: `fw=1.2.1 confirmed=1`, `saved=1`, pairing kept (`beacon_key=07abd2e3`), floor restored, `match=54 stale=0`, GREEN.
+  - Save **without** holding the button → the app said "Found a dongle, but its button isn't held…". Holding it → saved. So the held-flag advert and the app's held-only connect both work.
 - [ ] Still to test (optional): a second phone running the app doesn't trigger it (`beacons=` rises, `match=` doesn't).
 - [ ] (Original 1.2.0 test plan, kept for reference.) The order matters:
   1. Install the new app (it stops sending the beacon name).
