@@ -43,7 +43,6 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -90,7 +89,6 @@ class MainActivity : ComponentActivity() {
                 // ---- form state ----
                 // Credentials are never stored on the phone: they start blank, and
                 // blank means "leave the dongle's current value alone".
-                LaunchedEffect(Unit) { Config.purgeSecrets(context) }
                 var password by remember { mutableStateOf("") }
                 var passwordVisible by remember { mutableStateOf(false) }
                 var username2 by remember { mutableStateOf("") }

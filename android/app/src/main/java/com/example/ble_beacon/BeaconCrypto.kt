@@ -45,7 +45,7 @@ object BeaconCrypto {
     /**
      * Parse a dongle's config-window manufacturer data (company ID 0xFFFF).
      * Returns whether its button is held, or null if it isn't that advert
-     * (older firmware has none).
+     * (then it isn't a fw 1.2+ dongle and the app won't connect to it).
      */
     fun dongleButtonHeld(mfg: ByteArray?): Boolean? {
         if (mfg == null || mfg.size != 4) return null

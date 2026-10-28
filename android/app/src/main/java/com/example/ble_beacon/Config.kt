@@ -1,7 +1,7 @@
 package com.example.ble_beacon
 
-import android.annotation.SuppressLint
 import android.content.Context
+import androidx.core.content.edit
 import java.util.UUID
 
 /**
@@ -44,34 +44,17 @@ object Config {
     // The dongle's advertised name (CONFIG_BT_DEVICE_NAME in firmware).
     const val DONGLE_NAME = "BLE_Password"
 
-    // ---- Defaults (match firmware compiled defaults) ----
-    const val DEFAULT_PASSWORD = "12345678"
-    const val DEFAULT_GREEN_THRESHOLD = -71
-    const val DEFAULT_BLUE_THRESHOLD = -100
-
     // ---- Firmware limits (match firmware) ----
     const val PASSWORD_MAX_LEN = 64
 
+    // Credentials are NEVER stored on the phone: they only live in the UI until
+    // they've been sent (sealed) to the dongle. Only the thresholds are saved.
     private const val PREFS = "ble_password_cfg"
     private const val KEY_GREEN = "green_threshold"
     private const val KEY_BLUE = "blue_threshold"
 
-    // Credentials are NEVER stored on the phone: they only live in the UI until
-    // they've been sent to the dongle. These keys are only here so purgeSecrets()
-    // can delete what older app versions saved in plain text.
-    private val LEGACY_SECRET_KEYS = listOf("password", "password2", "username2")
-
     private fun prefs(ctx: Context) =
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-
-    /** Remove credentials saved by older app versions (call once at startup). */
-    @SuppressLint("ApplySharedPref") // commit(): wipe the plaintext now, not in the background
-    fun purgeSecrets(ctx: Context) {
-        val p = prefs(ctx)
-        if (LEGACY_SECRET_KEYS.any { p.contains(it) }) {
-            p.edit().apply { LEGACY_SECRET_KEYS.forEach { remove(it) } }.commit()
-        }
-    }
 
     // When nothing has been saved yet, the getters return EMPTY strings so the
     // UI fields start blank (the user fills them in), rather than pre-filling the
@@ -86,10 +69,9 @@ object Config {
 
     /** Persist the non-secret settings (so the form shows them next time). */
     fun save(ctx: Context, green: Int, blue: Int) {
-        prefs(ctx).edit()
-            .remove("beacon_name")   // pre-1.2 setting, no longer used
-            .putInt(KEY_GREEN, green)
-            .putInt(KEY_BLUE, blue)
-            .apply()
+        prefs(ctx).edit {
+            putInt(KEY_GREEN, green)
+            putInt(KEY_BLUE, blue)
+        }
     }
 }

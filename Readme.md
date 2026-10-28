@@ -6,7 +6,8 @@ The dongle plugs into your PC and acts as a USB keyboard. It listens for a
 Bluetooth LE beacon broadcast by your phone and estimates how close the phone
 is from its signal strength:
 
-- **Phone close + button pressed** → the dongle types your password and presses Enter.
+- **Phone close + short button press** → the dongle types your password 1 and presses Enter.
+- **Phone close + long (~1 s) button press** → the dongle types your username 2 + Tab + password 2 and presses Enter.
 - **Phone walks away** (or its beacon disappears) → the dongle presses **Win+L** and locks the PC.
 
 A companion Android app (in [`android/`](android/)) broadcasts the beacon,
@@ -104,7 +105,7 @@ averaged_rssi=-82
 
 1. Plug in the dongle. It opens a **60 s config window** (blinking blue).
 2. In the app, enter the green and blue thresholds (dBm), and any credentials you want to change.
-3. **Hold the dongle's button** and tap **Save & Send to Dongle**. Writes are only accepted while the button is physically held. That's the proof that whoever is configuring the dongle owns it. The first save also **pairs** the dongle with your phone's beacon key. A dongle that isn't paired never sees any phone. One phone can be paired with several dongles, but each dongle has one phone.
+3. **Hold the dongle's button** and tap **Save & Send to Dongle**. Writes are only accepted while the button is physically held and the dongle is within its config period. That's the proof that whoever is configuring the dongle owns it. The first save also **pairs** the dongle with your phone's beacon key. A dongle that isn't paired never sees any phone. One phone can be paired with several dongles, but each dongle has one phone.
 
 A short tap (< 0.5 s) on the button ends the config window early. It also ends
 when the app disconnects, or after 60 s. Then the dongle starts scanning.
@@ -140,6 +141,31 @@ value". A checkbox removes username 2 and password 2 from the dongle.
 | 0x76000–0xDC000 | Slot 1: update upload target |
 | 0xDC000–0xE0000 | Saved config (raw flash record at 0xDC000) + beacon counter log (0xDD000, 0xDE000) |
 | 0xE0000–0x100000 | Official dongle: Nordic bootloader (kept for last-resort recovery) |
+
+### Flash wear
+
+The nRF52840's flash is rated for at least **10,000 erase cycles per 4 KB
+page**. Wear comes from erasing a page; appending a small write into
+already-erased space barely counts. The dongle writes flash in only three
+places:
+
+| What | When it writes | Typical rate |
+|---|---|---|
+| Saved settings (0xDC000) | Only when you save from the app: 1 erase + 1 write | A few times a year |
+| Beacon counter log (0xDD000 + 0xDE000) | One 4-byte entry per lock, plus one every 5 min while your phone is in range | ~100–300 entries/day |
+| Firmware slots | Only during a firmware update | A few times a year |
+
+The counter log is the only part written daily, and it is built to avoid
+wear:
+
+- Entries are appended into erased space. Each page holds 1,024 entries and is erased only when full, after which logging moves to the other page. One erase covers 1,024 entries, and the two pages share the erases.
+- Each word is written only once between erases.
+
+**Worst case:** the phone sits next to the dongle 24 hours a day. That's
+about 300 entries a day, so each page is erased about once a week (~54
+times a year). The flash would then last **10,000 ÷ 54 ≈ 185 years**. A
+normal office day (~150 entries) gives about **370 years**. Flash wear is
+not a practical limit.
 
 ---
 
@@ -221,13 +247,13 @@ debug access enabled. Use `--sectorerase` (not `--chiperase`) so UICR is preserv
 3. The app checks that the dongle's board matches the image. It then arms the update, uploads to slot 1 over SMP, and resets the dongle.
 4. MCUboot swaps the images (the LED is dark for ~15 s). The new firmware confirms itself at boot. If it crashes before that, MCUboot rolls back on the next reset.
 
-Settings survive updates. The config record is versioned and only ever extended.
+Settings survive updates from 1.2.0 on. The config record is versioned and only ever extended. Since 1.2.1 the dongle no longer loads records from before 1.2, which have no beacon key, so a dongle coming from older firmware has to be set up again.
 
 ---
 
 ## Android app
 
-Kotlin / Jetpack Compose, in [`android/`](android/). It uses Nordic's
+Kotlin / Jetpack Compose, in [`android/`](android/), for **Android 8.0 or newer**. It uses Nordic's
 `mcumgr-ble` for updates.
 
 ```
@@ -274,6 +300,7 @@ unless DFU has been armed.
 
 ## Security notes
 
+- **Passwords are write-only over BLE.** The password, username 2, password 2 and beacon-key characteristics accept writes only. The dongle has no way to read them back out over Bluetooth, not even for the paired phone or with the button held. The firmware-update service (SMP) handles only firmware images, not the config storage. The only way they ever leave the dongle is typed over USB: the password when you press the button, and the 5 s status dump. Both happen only while your phone is in the green zone.
 - Passwords are stored **unencrypted** in the dongle's flash. Anyone with the dongle and an SWD debugger (or the MDBT50Q's pads) can read them. Treat the dongle like a key.
 - Builds are signed with **NCS's default MCUboot development key**, which is public. Physical access (the button hold) is what protects updates. For anything serious, generate your own key and set `SB_CONFIG_BOOT_SIGNATURE_KEY_FILE`. After that, MCUboot must be reflashed once on every board.
 - The status dump only reveals credentials while the phone is in range.

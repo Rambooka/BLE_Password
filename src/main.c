@@ -634,14 +634,10 @@ static volatile bool cfg_loaded;    /* true if valid config was loaded from flas
  * partition maps (pm_static_*.yml) at 0xDC000 on both boards: after MCUboot's
  * two image slots and, on the official dongle, below the Nordic bootloader
  * (0xE0000).  NVS/settings are not used (see CLAUDE.md). */
+/* Only the current layout is accepted (pre-1.2 records were dropped in 1.2.1:
+ * they hold no beacon key, so such a dongle must be set up again anyway).  If
+ * the layout ever changes, APPEND fields and bump the magic. */
 #define CFG_MAGIC      0xB1E50006u
-/* Older records are a prefix of this layout (fields are only ever appended), so
- * they still load — the missing fields start "not set" — instead of falling
- * back to defaults.  v3 = fw <= 1.1.3 (no password2), v4 = 1.1.4 (no username2),
- * v5 = 1.1.5-1.1.6 (no beacon key). */
-#define CFG_MAGIC_V3   0xB1E50003u
-#define CFG_MAGIC_V4   0xB1E50004u
-#define CFG_MAGIC_V5   0xB1E50005u
 #define STORAGE_OFFSET PM_CONFIG_STORAGE_ADDRESS
 #define STORAGE_ERASE  4096
 BUILD_ASSERT(PM_CONFIG_STORAGE_ADDRESS == 0xDC000,
@@ -700,16 +696,7 @@ static void config_load_from_flash(void)
 		LOG_ERR("flash_read failed (%d)", rc);
 		return;
 	}
-	if (cfg.magic == CFG_MAGIC_V3) {
-		cfg.password2[0] = '\0';   /* past the end of a v3 record */
-		cfg.username2[0] = '\0';
-		cfg.beacon_key_set = 0;
-	} else if (cfg.magic == CFG_MAGIC_V4) {
-		cfg.username2[0] = '\0';   /* past the end of a v4 record */
-		cfg.beacon_key_set = 0;
-	} else if (cfg.magic == CFG_MAGIC_V5) {
-		cfg.beacon_key_set = 0;    /* past the end of a v5 record */
-	} else if (cfg.magic != CFG_MAGIC) {
+	if (cfg.magic != CFG_MAGIC) {
 		LOG_INF("No saved config (magic=0x%08x) — using defaults", cfg.magic);
 		return;
 	}

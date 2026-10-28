@@ -66,15 +66,6 @@ class ConfigClient(
     // A dongle whose button ISN'T held was seen (someone else's, or not held yet).
     private var sawUnheldDongle = false
 
-    // Firmware older than 1.2 doesn't advertise the button flag. If that's the
-    // only kind of dongle around, connect to it after a short wait (so its
-    // firmware can still be updated).
-    private var legacyCandidate: BluetoothDevice? = null
-    private val legacyFallback = Runnable {
-        val dev = legacyCandidate
-        if (dev != null && gatt == null && !finished) connect(dev)
-    }
-
     private val scanTimeout = Runnable {
         if (gatt == null && !finished) {
             stopScan()
@@ -195,13 +186,11 @@ class ConfigClient(
             val held = BeaconCrypto.dongleButtonHeld(
                 result.scanRecord?.getManufacturerSpecificData(BeaconCrypto.COMPANY_ID)
             )
+            // Only ever connect to a dongle advertising "button held" (fw 1.2+).
             when (held) {
                 true -> connect(device)
                 false -> sawUnheldDongle = true
-                null -> if (legacyCandidate == null) {
-                    legacyCandidate = device
-                    main.postDelayed(legacyFallback, 3_000)
-                }
+                null -> {}   // no flag: pre-1.2 firmware, or not a dongle
             }
         }
 
@@ -220,7 +209,6 @@ class ConfigClient(
 
     private fun stopScan() {
         main.removeCallbacks(scanTimeout)
-        main.removeCallbacks(legacyFallback)
         try {
             scanner?.stopScan(scanCallback)
         } catch (_: Exception) {

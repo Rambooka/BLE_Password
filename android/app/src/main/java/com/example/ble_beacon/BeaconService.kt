@@ -3,9 +3,7 @@ package com.example.ble_beacon
 import android.annotation.SuppressLint
 import android.app.*
 import android.bluetooth.BluetoothManager
-import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseData
-import android.bluetooth.le.AdvertiseSettings
 import android.bluetooth.le.AdvertisingSet
 import android.bluetooth.le.AdvertisingSetCallback
 import android.bluetooth.le.AdvertisingSetParameters
@@ -21,7 +19,6 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
-import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
@@ -79,7 +76,7 @@ class BeaconService : Service() {
                 ContextCompat.RECEIVER_NOT_EXPORTED,
             )
             scheduleAlarm()
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && advertisingSet == null) {
+        } else if (advertisingSet == null) {
             startAdvertising()   // e.g. Bluetooth was off when we first started
         }
         return START_STICKY
@@ -152,19 +149,14 @@ class BeaconService : Service() {
             return
         }
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                val params = AdvertisingSetParameters.Builder()
-                    .setLegacyMode(true)       // plain advert every scanner understands
-                    .setConnectable(false)
-                    .setScannable(false)
-                    .setInterval(AdvertisingSetParameters.INTERVAL_LOW)  // ~100 ms
-                    .setTxPowerLevel(AdvertisingSetParameters.TX_POWER_HIGH)
-                    .build()
-                val cb = SetCallback().also { setCallback = it }
-                advertiser?.startAdvertisingSet(params, advertiseData(), null, null, null, cb)
-            } else {
-                startLegacy()
-            }
+            val params = AdvertisingSetParameters.Builder()
+                .setLegacyMode(true)       // plain advert every scanner understands
+                .setConnectable(false)
+                .setScannable(false)
+                .setInterval(AdvertisingSetParameters.INTERVAL_LOW)  // ~100 ms
+                .setTxPowerLevel(AdvertisingSetParameters.TX_POWER_HIGH)
+                .build()
+            advertiser?.startAdvertisingSet(params, advertiseData(), null, null, null, setCallback)
         } catch (e: SecurityException) {
             Log.e(TAG, "Permission denied to start advertising", e)
         }
@@ -172,32 +164,13 @@ class BeaconService : Service() {
 
     private fun updateAdvertisingData() {
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                advertisingSet?.setAdvertisingData(advertiseData())
-            } else {
-                advertiser?.stopAdvertising(legacyCallback)
-                startLegacy()
-            }
+            advertisingSet?.setAdvertisingData(advertiseData())
         } catch (e: SecurityException) {
             Log.e(TAG, "Permission denied to update advertising", e)
         }
     }
 
-    // Android 7.x has no AdvertisingSet: restart the advert with the new data.
-    private fun startLegacy() {
-        val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
-            .setConnectable(false)
-            .setTimeout(0)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
-            .build()
-        advertiser?.startAdvertising(settings, advertiseData(), legacyCallback)
-    }
-
-    // AdvertisingSetCallback only exists on Android 8+, so it must not be
-    // instantiated at construction time (that would crash on 7.x).
-    @RequiresApi(Build.VERSION_CODES.O)
-    private inner class SetCallback : AdvertisingSetCallback() {
+    private val setCallback = object : AdvertisingSetCallback() {
         override fun onAdvertisingSetStarted(set: AdvertisingSet?, txPower: Int, status: Int) {
             if (status == ADVERTISE_SUCCESS) {
                 advertisingSet = set
@@ -212,14 +185,6 @@ class BeaconService : Service() {
         }
     }
 
-    private var setCallback: Any? = null   // a SetCallback, on Android 8+
-
-    private val legacyCallback = object : AdvertiseCallback() {
-        override fun onStartFailure(errorCode: Int) {
-            Log.e(TAG, "LE Advertise Failed: $errorCode")
-        }
-    }
-
     override fun onDestroy() {
         super.onDestroy()
         running = false
@@ -228,11 +193,7 @@ class BeaconService : Service() {
         getSystemService(AlarmManager::class.java)?.cancel(alarmIntent())
         prefs().edit { putLong(KEY_CTR, ctr) }
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                (setCallback as? AdvertisingSetCallback)?.let { advertiser?.stopAdvertisingSet(it) }
-            } else {
-                advertiser?.stopAdvertising(legacyCallback)
-            }
+            advertiser?.stopAdvertisingSet(setCallback)
         } catch (e: SecurityException) {
             Log.e(TAG, "Permission denied to stop advertising", e)
         }
@@ -241,15 +202,12 @@ class BeaconService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val serviceChannel = NotificationChannel(
-                CHANNEL_ID,
-                "Beacon Service Channel",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(serviceChannel)
-        }
+        val serviceChannel = NotificationChannel(
+            CHANNEL_ID,
+            "Beacon Service Channel",
+            NotificationManager.IMPORTANCE_LOW
+        )
+        getSystemService(NotificationManager::class.java).createNotificationChannel(serviceChannel)
     }
 
     companion object {
