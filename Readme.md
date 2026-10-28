@@ -319,6 +319,9 @@ unless DFU has been armed.
 | `sysbuild/mcuboot/` | MCUboot config per board |
 | `pm_static_*.yml` | Fixed flash layout |
 | `flash_dongle.bat` | One-time official-dongle migration |
-| `tools/lint.ps1`, `.clang-tidy` | Lint |
+| `src/beacon_auth.*`, `src/cfg_crypto.*` | Rolling-beacon and encrypted-config crypto (plain C) |
+| `tests/host/` | Host unit tests for those modules (`run.ps1`) |
+| `tools/lint.ps1`, `.clang-tidy` | Lint + unit tests |
+| `tools/make_release.ps1` | Publishes a GitHub Release for a tag, with the build outputs attached |
 | `android/` | Companion Android app |
 | `CLAUDE.md` | Detailed engineering notes and hard-won hardware findings |

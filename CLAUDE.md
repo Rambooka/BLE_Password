@@ -31,7 +31,7 @@ Two different boards — **different LED/button pins**:
 | 0x00000 | dongle: Nordic MBR (0x0–0x1000) then MCUboot (0x1000–0x10000, USB serial recovery) · MDBT50Q: MCUboot (0x0–0x10000) |
 | 0x10000–0x76000 | slot 0 — running app (MCUboot header at 0x10000, app at 0x10200) |
 | 0x76000–0xDC000 | slot 1 — SMP upload target |
-| **0xDC000–0xE0000** | `config_storage` — raw persisted config (`PM_CONFIG_STORAGE_ADDRESS`; BUILD_ASSERTed == 0xDC000) |
+| **0xDC000–0xE0000** | `config_storage`: raw persisted config record at 0xDC000 (`PM_CONFIG_STORAGE_ADDRESS`, BUILD_ASSERTed == 0xDC000), plus the beacon counter log (ping-pong pages 0xDD000 / 0xDE000). 0xDF000 is free |
 | 0xE0000–0x100000 | dongle: Nordic bootloader + settings (reserved) · MDBT50Q: unused |
 
 ## Build environment (PowerShell)
@@ -49,19 +49,28 @@ west build -b nrf52840dk/nrf52840     -d build_mdbt50q  -p always --sysbuild .
 ```
 Outputs per build dir: `dfu_application.zip` (signed app + manifest = BLE update package, bundled into the Android app), `merged.hex` (MCUboot + app, for J-Link), `BLE_Password/zephyr/zephyr.signed.bin`. Dongle build also makes `dongle_mcuboot_migration.zip` (Nordic-bootloader package containing **only MCUboot**). Version comes from `VERSION` (currently 1.2.1) → shown in the app and in the status dump. **Always bump it for a new image**: the app's updater silently skips the upload if the dongle already runs an image with the same hash, and two different images with the same version can't be told apart.
 
-**Lint + unit tests — run after EVERY code change (firmware or app), before committing.** `lint.ps1` also runs `tests/host/run.ps1`, which builds the pure-C `beacon_auth.c` with Strawberry `gcc` against the FIPS/RFC/Python vectors, plus `:app:testDebugUnitTest`. The firmware and app vectors are shared, so a beacon-format change must update both tests.
+**Lint + unit tests — run after EVERY code change (firmware or app), before committing.** `lint.ps1` also runs `tests/host/run.ps1`, which builds every `tests/host/*_test.c` against the pure-C modules (`beacon_auth.c`, `cfg_crypto.c`) with Strawberry `gcc`, using FIPS/RFC/Python vectors. It also runs `:app:testDebugUnitTest` (`BeaconCryptoTest`, `ConfigSessionTest`). The firmware and app vectors are shared, so a change to the beacon or session format must update both sides' tests. New pure-C modules go in `run.ps1`'s `$modules` list.
 ```
 powershell -ExecutionPolicy Bypass -File tools\lint.ps1             # both
 powershell -ExecutionPolicy Bypass -File tools\lint.ps1 -Firmware   # after a west build of both boards
 powershell -ExecutionPolicy Bypass -File tools\lint.ps1 -Android [-AndroidDir <app dir>]
 ```
 - **Firmware = clang-tidy** (`C:\Program Files\LLVM\bin\clang-tidy.exe`, LLVM 18) on `src/*.c`, for **both** boards (main.c has board `#ifdef`s). The script reuses each build's `compile_commands.json`, strips GCC-only flags and adds `--target=arm-none-eabi`, so build first. Checks are in `.clang-tidy`: bugprone/cert/clang-analyzer/misc, with Zephyr noise off and the reason given for each. Target: **zero findings**. Fix real issues. Silence false positives with a targeted `NOLINTNEXTLINE(check): reason` (as on the `K_THREAD_DEFINE` lines), not by disabling checks globally.
-- **App = Android Lint** (`gradlew :app:lintRelease`, report `app\build\reports\lint-results-release.html`). Target: **zero errors** (errors fail the task). Don't add new warnings. Known existing warnings (20, 2026-10-29): dependency upgrades, `OldTargetApi`, unused template colours, `UseKtx`/`UseTomlInstead`/`RedundantLabel` style. Upgrading dependencies is a separate, deliberate change, not a lint fix.
+- **App = Android Lint** (`gradlew :app:lintRelease`, report `app\build\reports\lint-results-release.html`). Target: **zero errors** (errors fail the task). Don't add new warnings. Known existing warnings (18, as of 1.2.1): dependency upgrades, `OldTargetApi`, unused template colours, `UseKtx`/`UseTomlInstead`/`RedundantLabel` style. Upgrading dependencies is a separate, deliberate change, not a lint fix.
 - First run (2026-10-29) found and fixed:
   - firmware: 4× `strcpy` → size-asserted `memcpy`, RSSI sum `int16_t` → `int32_t`;
   - app: the API 33+ `writeCharacteristic` result was compared to `GATT_SUCCESS` instead of `BluetoothStatusCodes.SUCCESS` (both 0, so it worked by luck); `remember { purgeSecrets() }` → `LaunchedEffect`.
 
-**Release flow:** bump `VERSION` → build both boards → build the Android app (it copies both `dfu_application.zip` in) → users update from the app.
+**Release flow:**
+1. Bump `VERSION`.
+2. Build both boards.
+3. Run `tools\lint.ps1`.
+4. Build the release APK (it copies both `dfu_application.zip` in), then install and test on hardware.
+5. Commit and push.
+6. Annotated tag `vX.Y.Z` + `git push origin vX.Y.Z`.
+7. Run `pwsh -File tools\make_release.ps1 -Tag vX.Y.Z -Notes <notes.md>`. It creates the GitHub Release via the REST API, using git's stored RambookaICT token; `gh` isn't installed. It uploads the APK, both DFU zips, the dongle migration zip + `zephyr.signed.bin`, and the MDBT50Q `merged.hex`. Use **pwsh 7**, not Windows PowerShell 5: PS5 garbles `git credential fill`'s stdin.
+
+Users then update from the app. Releases: https://github.com/Rambooka/BLE_Password/releases (v1.2.1 = first release, 2026-10-29).
 
 **Official dongle — ONE-TIME migration to MCUboot** (`flash_dongle.bat`):
 1. Dongle in Nordic DFU (RESET, or SW1+replug → pulsing red; enumerates `nRF52 SDFU USB`, e.g. COM20) → `nrfutil dfu usb-serial -pkg build_nRF52840\dongle_mcuboot_migration.zip -p COM20`. I can't put it in DFU — ask the user.
@@ -140,25 +149,25 @@ Compose UI: Password (short press), Username 2 + Password 2 (1-second press, opt
 - mcumgr 3.x requires **compileSdk 37** and **Kotlin 2.4.10** (both set; targetSdk still 36).
 - **Credentials are never stored on the phone** (2026-10-28): the password fields start blank and are cleared after a successful send. Blank = "keep the dongle's current value" (not written). The "Remove Username 2 + Password 2" checkbox sends empty writes to clear login 2. Only the thresholds are saved in SharedPreferences, plus the beacon counter and the wrapped beacon key. (`purgeSecrets()` for pre-2026-10-28 plaintext was removed in the legacy cleanup.) **minSdk 26** (Android 8): `AdvertisingSet` only; the Android 7 advertising restart path and the `mipmap-anydpi` (non-adaptive) icons are gone. Password fields use `KeyboardType.Password` (no IME learning).
 - **No backup:** `allowBackup="false"`, and `data_extraction_rules.xml` / `backup_rules.xml` exclude everything (allowBackup=false alone doesn't stop Android 12+ device-to-device transfer).
-- Build: **release**, `gradlew.bat :app:assembleRelease` (JAVA_HOME = Android Studio JBR); install `adb install -r app\build\outputs\apk\release\app-release.apk`. A release build is not debuggable, so `adb shell run-as` can't read the app's data. That route was verified readable on the old debug build, without root. Signing key: `%USERPROFILE%\.android\ble_beacon_release.jks` plus `ble_beacon_keystore.properties` (passwords). Both are **outside the repo — back them up**. A lost key means uninstall + reinstall, and the beacon/threshold settings must be re-entered. Override the location with `-PreleaseKeystoreProps=...`. Debug builds (`assembleDebug`) are signed with a different key, so switching between debug and release requires `adb uninstall com.example.ble_beacon` first.
+- Build: **release**, `gradlew.bat :app:assembleRelease` (JAVA_HOME = Android Studio JBR); install `adb install -r app\build\outputs\apk\release\app-release.apk`. A release build is not debuggable, so `adb shell run-as` can't read the app's data. That route was verified readable on the old debug build, without root. Signing key: `%USERPROFILE%\.android\ble_beacon_release.jks` plus `ble_beacon_keystore.properties` (passwords). Both are **outside the repo — back them up**. A lost key means uninstall + reinstall. That also wipes the app's Keystore-wrapped **beacon key**, so the phone gets a new beacon ID: every dongle must be **re-paired** (hold the button + Save), and the thresholds re-entered. Override the location with `-PreleaseKeystoreProps=...`. Debug builds (`assembleDebug`) are signed with a different key, so switching between debug and release requires `adb uninstall com.example.ble_beacon` first (same consequence: re-pair the dongles).
 
 ## Status / TODO
 - [x] MCUboot + BLE SMP update on both boards; app bundles both images.
-- [x] **Official dongle (2026-10-28): fully verified on hardware.** Migrated to MCUboot (nrfutil on COM20, then smpmgr over MCUboot recovery on COM75). BLE updates from the app (Galaxy S21 Ultra) 1.1.0 → 1.1.1 → 1.1.2 → 1.1.3 all worked: progress bar, ~15 s dark during the MCUboot swap, then the config window; `confirmed=1`; saved config survived every update and a power cycle (so the Nordic bootloader → MCUboot → app chain is fine). **Now running v1.1.4** (second password); password-hiding when not GREEN verified.
+- [x] **Official dongle (2026-10-28): fully verified on hardware.** Migrated to MCUboot (nrfutil on COM20, then smpmgr over MCUboot recovery on COM75). BLE updates from the app (Galaxy S21 Ultra) 1.1.0 → 1.1.1 → 1.1.2 → 1.1.3 all worked: progress bar, ~15 s dark during the MCUboot swap, then the config window; `confirmed=1`; saved config survived every update and a power cycle (so the Nordic bootloader → MCUboot → app chain is fine). Password-hiding when not GREEN verified. **Now running v1.2.1** (see below).
 - [x] **MDBT50Q: both units are bricked (scrap)** by the QSPI/reset-pin reset loop (constraint 8). Unit 1 by the original standalone app; unit 2 by `merged.hex` v1.1.3. Software recovery is impossible (CTRL-AP unreachable); the P0.19↔RESET link is between module pads 40 and 42 **under the module shield**, so only hot-air removal of the module could save them. Details below.
 - [ ] **MDBT50Q: flash a NEW unit** with the fixed build (recover first — see "3rd-party board first flash"), verify over RTT, then test a BLE update from the app. The fixed image (QSPI off, no `gpio-as-nreset`) has not run on hardware yet.
 - Investigation notes (2nd unit, 2026-10-28): J-Link reached it fine (FICR read OK), `merged.hex` v1.1.3 programmed + verified with `--sectorerase`, then after reset: no LED, no USB, J-Link "Found SW-DP ID 0x2BA01477 / Failed to power up DAP", `--recover` times out (also at 1 MHz). Ruled out: LF clock (RC in both app + MCUboot), UICR in the hex (none), supply (T3–T4 steady 3.3 V), old tools (nrfjprog 10.24.2 / J-Link 8.96). DCDC REG0/REG1 identical in working `led_test`. **Board quirk: P0.19 is tied to P0.18/nRESET on the dongle PCB** — same as Nordic's PCA10059 (`BSP_SELF_PINRESET_PIN` = P0.19, lets firmware pin-reset itself), confirmed by a Nordic DevZone answer (thread 96060) citing Raytac's reference circuit; in the schematic the box under pins 41/42 joins pin 40 (RESET) to 42 (P0.19). The DK's QSPI flash has SCK on P0.19 (high-drive), and the DK DT sets `gpio-as-nreset` (boot code writes UICR.PSELRESET=P0.18) → the app's QSPI init held reset low → reset loop before `main()` (no LED/USB, "Failed to power up DAP"). **Fixed** (built + bundled in the app, not yet run on hardware): `&qspi`/`&mx25r64` disabled and `gpio-as-nreset` deleted in `boards/nrf52840dk_nrf52840.overlay` and `sysbuild/mcuboot/boards/nrf52840dk_nrf52840.overlay`. **Software recovery of the reset-looping units FAILED (2026-10-28):** DP answers (IDR 0x2BA01477) but CTRL/STAT stays 0xD0000040 = CSYSPWRUPACK set, **CDBGPWRUPACK never set**, so CTRL-AP is unreachable (its IDR reads 0) and ERASEALL can't be issued — tried nrfjprog `--recover` (also 1 MHz), pyOCD `erase --mass`, and raw CTRL-AP via J-Link Commander and pyOCD register-level (`scratchpad ctrlap_unlock.py`). Recovery needs the loop stopped in hardware (break the P0.19↔P0.18 link) — but per the module pad map (`Raytac_MDBT50Q.pdf` p7), pins 40 (RESET) and 42 (P0.19) are **adjacent pads in the inner right-hand column, under the module shield**; photos of both PCB sides (`RayTac\PCB_Top/Bottom.heic`) show no exposed link. Only fix is hot-air removal of the module → the two looping units are effectively scrap. (Note: J-Link Commander's raw `SWDReadAP` returned 0 for everything here because the debug domain was never powered — its "writes" never landed.) APPROTECT (rev 3) was also on (`APPROTECTSTATUS` 0) — our firmware only SW-unlocks SWD when UICR.APPROTECT=HwDisabled, hence recover first on new units. The Gerber in `MDBT50Q-RX Gerber for Programming Jig (210205)` is the pogo-pin jig (no copper), not the dongle layout; Raytac doesn't publish the dongle's PCB files (ask Raytac support). Raytac's MDBT50Q-RX approval sheet (Ver. E, 2020-06-19, §8 Reference Circuit) draws the same 41–42 tie, and says **"External 32.768 kHz is already inside the dongle"** — so the crystal IS fitted, and the earlier "no LED" on unit 1 was most likely this QSPI contention, not the LFXO (the RC clock setting is harmless; keep or revert). Same sheet: REG0 DC/DC + LDO disabled by default (VDDH tied to VDD = normal-voltage mode).
 - [x] **v1.1.4 = second password** (medium ~1 s press), built for both boards; the app (Password 2 field) is built with both 1.1.4 images bundled. The MDBT50Q 1.1.4 image keeps the QSPI/reset fix (verified in `.config`).
 - [x] **Verified on the official dongle (2026-10-28):** app installed, BLE update 1.1.3 → 1.1.4, and Password 2 set from the app. Short press types password 1 and a ~1 s press types password 2 — user confirmed "works great".
 - [x] **v1.1.5 = Username 2** (medium press types username → TAB → password 2 → Enter, for a database login form). Built for both boards (MDBT50Q still has no QSPI/pin-reset), and the app with the Username 2 field is installed on the phone.
-- [ ] Verify 1.1.5 on the official dongle: after the BLE update the dump shows `fw=1.1.5` and `username2=(not set)` with the passwords kept (v4→v5 record), then set Username 2 and test the login.
-- [ ] **NEXT (left off 2026-10-28):**
+- [x] 1.1.5's username 2 was never tested on its own; it's superseded and verified working on 1.2.x (username 2 + TAB + password 2).
+- [x] **Repo housekeeping (2026-10-28/29):**
   - [x] **(a) GitHub push done (2026-10-29).** RambookaICT is now a collaborator on Rambooka/BLE_Password, and `main` tracks `origin/main`.
-  - [x] **(b) Android app is in `android/` (2026-10-29).** The folder couldn't be moved: something held a handle on the `BLE_Beacon` root folder itself. No file in it was open, and no visible process had it as its current directory, even after the Gradle and Kotlin daemons were stopped. So it was **copied** and verified by SHA-256 (58/58 files). Done: `firmwareDir` now defaults to the repo root, `android/.gitignore` ignores `.idea/`, `.kotlin/`, `app/google-services.json` and keystores, and the build and lint run from the new location. **The old copy `C:\Users\rabram\Source\Android\BLE_Beacon` is stale. Delete it once it's unlocked (e.g. after a reboot). Don't edit it.**
+  - [x] **(b) Android app is in `android/` (2026-10-29).** The folder couldn't be moved: something held a handle on the `BLE_Beacon` root folder itself. No file in it was open, and no visible process had it as its current directory, even after the Gradle and Kotlin daemons were stopped. So it was **copied** and verified by SHA-256 (58/58 files). Done: `firmwareDir` now defaults to the repo root, `android/.gitignore` ignores `.idea/`, `.kotlin/`, `app/google-services.json` and keystores, and the build and lint run from the new location. The old copy at `C:\Users\rabram\Source\Android\BLE_Beacon` is stale (see the open item below).
   - [x] Removed Android Studio's unused "Baking with Gemini" template screen, along with Firebase, the google-services plugin and viewmodel-compose (2026-10-29). Verified that a fresh `git clone` builds with no `google-services.json`. The local `android/app/google-services.json` is now unused but still git-ignored, because it contains a Firebase API key.
   - [x] **(c) `Readme.md` rewritten for the public repo (2026-10-29).** Keep it in step with behaviour changes: button timings, LEDs, status dump fields, GATT table.
 - [x] **v1.1.6:** the status dump prints `averaged_rssi=` on its own line (`gone` after the 5 s beacon timeout).
-- [x] **v1.2.0 = secure rolling beacon + office coexistence (2026-10-29).** Built for both boards (MDBT50Q still has QSPI/pin-reset off), host tests and Android unit tests pass, lint clean, and the app is built with 1.2.0 bundled. **Not yet run on hardware.**
+- [x] **v1.2.0 = secure rolling beacon + office coexistence (2026-10-29).** Built for both boards (MDBT50Q still has QSPI/pin-reset off), host tests and Android unit tests pass, lint clean, and the app is built with 1.2.0 bundled.
 - [x] **1.2.0 partly verified on the official dongle (2026-10-29):**
   - BLE update 1.1.x → 1.2.0, `confirmed=1`.
   - Save with the button held paired the dongle (`beacon_key=07abd2e3`) and set the passwords and username 2 through the **ECDH-sealed** writes. So PSA ECDH works on hardware, and `saved=1`.
@@ -171,25 +180,16 @@ Compose UI: Password (short press), Username 2 + Password 2 (1-second press, opt
   - BLE update 1.2.0 → 1.2.1 from the new app worked.
   - Dump: `fw=1.2.1 confirmed=1`, `saved=1`, pairing kept (`beacon_key=07abd2e3`), floor restored, `match=54 stale=0`, GREEN.
   - Save **without** holding the button → the app said "Found a dongle, but its button isn't held…". Holding it → saved. So the held-flag advert and the app's held-only connect both work.
-- [ ] Still to test (optional): a second phone running the app doesn't trigger it (`beacons=` rises, `match=` doesn't).
-- [ ] (Original 1.2.0 test plan, kept for reference.) The order matters:
-  1. Install the new app (it stops sending the beacon name).
-  2. Update the dongle to 1.2.0. The dongle stays BLUE until it's paired.
-  3. Hold the button and Save: the app pairs, then 3 green blinks.
-  4. Expect GREEN, and the status dump shows `beacon_key=` matching the app's ID, with `match` rising.
-
-  Then test:
-  - walk away → lock;
-  - come back → GREEN without touching the phone (if it stays blue, check `stale` and how fast the phone ticks);
-  - a second phone running the app doesn't trigger it (`beacons` rises, `match` doesn't);
-  - unplug/replug → `floor` restored and the phone still accepted.
-- [x] **Encrypted config session (ECDH, 2026-10-29), part of 1.2.0.** Host tests (12 KDF/seal vectors) and Android tests pass, including a real JCA ECDH round trip against a stand-in dongle. **The firmware's PSA ECDH has not run on hardware yet.** First test:
-  - a Save that sets a password should succeed;
-  - if it fails with "invalid session key" or write rejected 0x13, suspect PSA or Oberon;
-  - a crash (fast red flash) on Save would point to a stack overflow in BT RX.
+- [x] **Encrypted config session (ECDH, 2026-10-29), part of 1.2.0.** Host tests (12 KDF/seal vectors) and Android tests pass, including a real JCA ECDH round trip against a stand-in dongle. **Works on hardware**: the 1.2.0 pairing save went through the sealed writes. If it ever breaks:
+  - "invalid session key" or write rejected 0x13 → suspect PSA or Oberon;
+  - a fast red flash on Save → a BT RX stack overflow.
 
   This was chosen over BLE LE Secure Connections, which would mean a pairing popup on every save and needs bond storage (no NVS here).
-- [ ] Possible follow-up: authenticate the ECDH (e.g. LED-blink or app-code comparison) to also stop an active relay during the config window.
+- [x] **GitHub tag + Release v1.2.1 (2026-10-29):** https://github.com/Rambooka/BLE_Password/releases/tag/v1.2.1, with 6 assets (see "Release flow").
+- [ ] Optional test: a second phone running the app doesn't trigger the dongle (`beacons=` rises, `match=` doesn't).
+- [ ] **Security follow-up (highest value): authenticate the dongle to the app.** The ECDH is unauthenticated, and the "held" flag can be faked. So a **fake dongle** advertising the service + "held" near you while you tap Save would receive, and could decrypt, your passwords and beacon key. An active relay during the window is the same class of attack. Fix: give the dongle a long-term identity key pair (in `config_storage`); the app pins its public key at first pairing (trust on first use) and binds the session to it, refusing any other dongle afterwards.
+- [ ] Delete the stale old app folder `C:\Users\rabram\Source\Android\BLE_Beacon` once it's unlocked (e.g. after a reboot). Don't edit it.
+- [ ] No `LICENSE` file yet. The sources say Apache-2.0, so add a matching LICENSE if others should be able to reuse the code.
 - [ ] Decide whether to drop RTT/logging on the MDBT50Q production build.
 - [ ] Production signing key (constraint 7) — deferred; the button gate is accepted for now.
 
