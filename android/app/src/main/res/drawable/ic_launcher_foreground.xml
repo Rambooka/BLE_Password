@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Launcher icon foreground: a padlock with beacon waves (proximity unlock).
+     Kept inside the 66dp adaptive-icon safe zone. Also used as the themed
+     (monochrome) icon, which only uses the shapes' alpha. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group android:translateY="3">
+        <!-- Shackle -->
+        <path
+            android:pathData="M38,50 V43 A10,10 0 0,1 58,43 V50"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeWidth="5"
+            android:strokeLineCap="round" />
+        <!-- Body with a keyhole cut out -->
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:fillType="evenOdd"
+            android:pathData="M36,48 H60 A4,4 0 0,1 64,52 V70 A4,4 0 0,1 60,74 H36 A4,4 0 0,1 32,70 V52 A4,4 0 0,1 36,48 Z
+                M48,54.5 A3.5,3.5 0 0,0 46.3,61.1 L45.5,66 H50.5 L49.7,61.1 A3.5,3.5 0 0,0 48,54.5 Z" />
+        <!-- Beacon waves -->
+        <path
+            android:pathData="M63.2,35.1 A7,7 0 0,1 68.9,40.8"
+            android:strokeColor="#FF69F0AE"
+            android:strokeWidth="4"
+            android:strokeLineCap="round" />
+        <path
+            android:pathData="M64.1,30.2 A12,12 0 0,1 73.8,39.9"
+            android:strokeColor="#FF69F0AE"
+            android:strokeWidth="4"
+            android:strokeLineCap="round" />
+        <path
+            android:pathData="M65,25.3 A17,17 0 0,1 78.7,39"
+            android:strokeColor="#FF69F0AE"
+            android:strokeWidth="4"
+            android:strokeLineCap="round" />
+    </group>
+</vector>

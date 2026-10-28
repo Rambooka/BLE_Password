@@ -10,7 +10,7 @@ configures the dongle over BLE, and **carries the dongle firmware** for BLE upda
 ## Repos / paths
 - Firmware: `c:\Users\rabram\Source\nRFConnect\BLE_Password` (this folder). App code in `src/main.c`. Git repo → **https://github.com/Rambooka/BLE_Password (PUBLIC)**. Never commit real passwords, keys, or build output (`.gitignore`: `build*/`, `*.7z`, `.claude/`). Local git's stored GitHub credential is for the **RambookaICT** account.
 - LED/button bring-up test (3rd-party board): `c:\Users\rabram\Source\nRFConnect\led_test`.
-- Android app: `C:\Users\rabram\Source\Android\BLE_Beacon` (Kotlin/Compose). Advertises the beacon, GATT config client, SMP firmware updater.
+- Android app: `android/` in this repo (Kotlin/Compose; moved from `C:\Users\rabram\Source\Android\BLE_Beacon` 2026-10-29 — that old copy is stale). Advertises the beacon, GATT config client, SMP firmware updater.
 - Datasheets / 3rd-party board info: `C:\_Datasheets\BLE Modules\RayTac\` (see `Rays Notes.txt`).
 
 ## Hardware targets
@@ -57,7 +57,6 @@ powershell -ExecutionPolicy Bypass -File tools\lint.ps1 -Android [-AndroidDir <a
 ```
 - **Firmware = clang-tidy** (`C:\Program Files\LLVM\bin\clang-tidy.exe`, LLVM 18) on `src/*.c`, for **both** boards (main.c has board `#ifdef`s). The script reuses each build's `compile_commands.json`, strips GCC-only flags and adds `--target=arm-none-eabi`, so build first. Checks are in `.clang-tidy`: bugprone/cert/clang-analyzer/misc, with Zephyr noise off and the reason given for each. Target: **zero findings**. Fix real issues. Silence false positives with a targeted `NOLINTNEXTLINE(check): reason` (as on the `K_THREAD_DEFINE` lines), not by disabling checks globally.
 - **App = Android Lint** (`gradlew :app:lintRelease`, report `app\build\reports\lint-results-release.html`). Target: **zero errors** (errors fail the task). Don't add new warnings. Known existing warnings (2026-10-29): dependency upgrades, `OldTargetApi`, unused template colours and the Baking sample's images, `UseKtx`/`UseTomlInstead`/`RedundantLabel` style. Upgrading dependencies is a separate, deliberate change, not a lint fix.
-- The `-AndroidDir` default is `..\android` (the planned in-repo location). Until the move, pass `-AndroidDir C:\Users\rabram\Source\Android\BLE_Beacon`.
 - First run (2026-10-29) found and fixed:
   - firmware: 4× `strcpy` → size-asserted `memcpy`, RSSI sum `int16_t` → `int32_t`;
   - app: the API 33+ `writeCharacteristic` result was compared to `GATT_SUCCESS` instead of `BluetoothStatusCodes.SUCCESS` (both 0, so it worked by luck); `remember { purgeSecrets() }` → `LaunchedEffect`.
@@ -115,7 +114,7 @@ Then confirm it booted over RTT before unplugging (`JLinkRTTLogger -Device NRF52
 
 ## Android app
 Compose UI: Password (short press), Username 2 + Password 2 (1-second press, optional) (passwords have eye show/hide), Beacon name, Green/Blue dBm, "Save & Send to Dongle", **"Update dongle firmware"** (dialog: pick Official dongle / MDBT50Q, shows the bundled version; progress bar), Start/Stop beacon. `BeaconService` advertises the beacon. `ConfigClient` scans/connects and either writes the 6 config characteristics (`send`; password 2 / username 2 skipped on old firmware when blank) or reads the board + arms DFU (`armDfu`). `FirmwareUpdater` = Nordic `mcumgr-ble` 3.4.1 `FirmwareUpgradeManager` in `TEST_ONLY` mode. `Firmware.kt` loads `assets/firmware/{nrf52840dongle,mdbt50q}.zip` and checks the manifest board. **The dongle's button must be held while saving / starting an update** (gate).
-- Firmware bundling: `bundleFirmware` task in `app/build.gradle.kts` copies `../../nRFConnect/BLE_Password/build_{nRF52840,mdbt50q}/dfu_application.zip` into generated assets (override with `-PfirmwareDir=...`). Missing zip → warning, that PCB shows "not bundled".
+- Firmware bundling: `bundleFirmware` task in `app/build.gradle.kts` copies `<repo root>/build_{nRF52840,mdbt50q}/dfu_application.zip` (default `firmwareDir` = `android/..`) into generated assets (override with `-PfirmwareDir=...`). Missing zip → warning, that PCB shows "not bundled".
 - mcumgr 3.x requires **compileSdk 37** and **Kotlin 2.4.10** (both set; targetSdk still 36).
 - **Credentials are never stored on the phone** (2026-10-28): the password fields start blank and are cleared after a successful send. Blank = "keep the dongle's current value" (not written). The "Remove Username 2 + Password 2" checkbox sends empty writes to clear login 2. Only the beacon name and thresholds are saved (SharedPreferences). `Config.purgeSecrets()` deletes plaintext credentials that older app versions saved. Password fields use `KeyboardType.Password` (no IME learning).
 - **No backup:** `allowBackup="false"`, and `data_extraction_rules.xml` / `backup_rules.xml` exclude everything (allowBackup=false alone doesn't stop Android 12+ device-to-device transfer).
@@ -132,13 +131,9 @@ Compose UI: Password (short press), Username 2 + Password 2 (1-second press, opt
 - [x] **v1.1.5 = Username 2** (medium press types username → TAB → password 2 → Enter, for a database login form). Built for both boards (MDBT50Q still has no QSPI/pin-reset), and the app with the Username 2 field is installed on the phone.
 - [ ] Verify 1.1.5 on the official dongle: after the BLE update the dump shows `fw=1.1.5` and `username2=(not set)` with the passwords kept (v4→v5 record), then set Username 2 and test the login.
 - [ ] **NEXT (left off 2026-10-28):**
-  - **(a) GitHub push:** 2 local commits are not pushed. The push got a 403 because local git is signed in as RambookaICT. Either add RambookaICT as a collaborator on Rambooka/BLE_Password, or the user pushes signed in as Rambooka.
-  - **(b) Move the Android app into `android/` in this repo.** The user wants it there. `Move-Item C:\Users\rabram\Source\Android\BLE_Beacon` failed because a file was in use (close Android Studio, VS Code windows and Explorer on that folder first). The build caches were already deleted; the source is intact.
-  - **After the move:**
-    - Change `bundleFirmware`'s default `firmwareDir` to `rootDir.resolve("..")`.
-    - Add `android/.gitignore` covering `build/`, `.gradle/`, `.kotlin/`, `.idea/`, `local.properties` and `app/google-services.json`. That file holds a Firebase API key: **do not publish** (the repo is public).
-    - Update paths here and in memory.
-  - Firebase is used only by the unused Android Studio "Baking" sample (`BakingScreen.kt`, `BakingViewModel.kt`, `baked_goods_*.jpg`). Offer to delete it along with the Firebase dependency, so a clone builds without `google-services.json`.
+  - **(a) GitHub push:** the local commits are not pushed. The push got a 403 because local git is signed in as RambookaICT. Either add RambookaICT as a collaborator on Rambooka/BLE_Password, or the user pushes signed in as Rambooka.
+  - [x] **(b) Android app is in `android/` (2026-10-29).** The folder couldn't be moved: something held a handle on the `BLE_Beacon` root folder itself. No file in it was open, and no visible process had it as its current directory, even after the Gradle and Kotlin daemons were stopped. So it was **copied** and verified by SHA-256 (58/58 files). Done: `firmwareDir` now defaults to the repo root, `android/.gitignore` ignores `.idea/`, `.kotlin/`, `app/google-services.json` and keystores, and the build and lint run from the new location. **The old copy `C:\Users\rabram\Source\Android\BLE_Beacon` is stale. Delete it once it's unlocked (e.g. after a reboot). Don't edit it.**
+  - Firebase is used only by the unused Android Studio "Baking" sample (`BakingScreen.kt`, `BakingViewModel.kt`, `baked_goods_*.jpg`). `google-services.json` is git-ignored (it holds a Firebase API key and the repo is public), **so a fresh clone won't build** until that sample and the Firebase plugin/dependency are deleted. Offer this to the user.
   - **(c) Rewrite `Readme.md` for the public repo** (user asked). It is still the original v0 description.
 - [x] **v1.1.6:** the status dump prints `averaged_rssi=` on its own line (`gone` after the 5 s beacon timeout). Built for both boards; not yet bundled in the app or run on hardware.
 - [ ] Decide whether to drop RTT/logging on the MDBT50Q production build.
