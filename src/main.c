@@ -3,8 +3,8 @@
  *
  * BLE Beacon Proximity Password Typer
  *
- * Scans for a configurable BLE beacon (default "Ray's 21 Ultra") and controls
- * LEDs by RSSI zone:
+ * Scans for a configurable BLE beacon (name set from the companion app) and
+ * controls LEDs by RSSI zone (thresholds also configurable):
  *   Not detected / RSSI < -100 dBm : Blue  LED solid (phone not seen)
  *   -100 to -71 dBm                : Red   LED solid (phone too far away)
  *   RSSI >= -71 dBm                : Green LED solid (phone beacon is close)
@@ -15,10 +15,10 @@
  *
  * Remote configuration (companion Android app):
  *   The dongle is also a connectable BLE peripheral exposing a small GATT
- *   "config" service.  The phone connects and writes a new password and/or a
- *   new target beacon name.  Both are stored in flash (Zephyr settings/NVS)
- *   and survive a reboot.  NOTE: updated values are loaded at boot only — a
- *   write takes effect on the NEXT power cycle, not immediately.
+ *   "config" service during the boot config window.  The phone writes the
+ *   passwords, beacon name and thresholds; they apply immediately and are
+ *   saved to a raw flash record (config_storage) that survives reboots and
+ *   firmware updates.
  *
  *   A write is only accepted while (a) the boot config window is open AND
  *   (b) the dongle's own button is physically held down at the instant the
