@@ -15,6 +15,31 @@ can be updated over the air.
 
 Built with Zephyr / nRF Connect SDK **v3.0.2** and MCUboot.
 
+### Secure rolling beacon (firmware 1.2.0+)
+
+The phone doesn't broadcast a name that anyone could copy. It broadcasts an
+**authenticated, rolling beacon** instead:
+
+```
+manufacturer data, company ID 0xFFFF:   'B' 'P' 01  counter[4]  tag[8]
+tag = first 8 bytes of HMAC-SHA256(key, 'B' 'P' 01 counter)
+```
+
+- **key** is 16 random bytes made by the phone and written to the dongle when you save (button held). On the phone it is stored encrypted under an Android Keystore key.
+- **counter** is the phone's clock in seconds (UTC, so time zones and daylight saving don't affect it). It never goes backwards, even if the clock is set back.
+- The dongle accepts a beacon only if the tag verifies with **its** key and the counter is fresh. After every lock, the counter must be newer than the last one accepted. This floor is also saved to flash, so it survives a reboot.
+
+As a result:
+
+- **Several people can work side by side.** Each phone has its own key, so a dongle ignores every other phone. When dongles are in their config window, each one advertises whether its button is held, and the app connects only to the dongle you're holding.
+- **Copying or replaying the beacon doesn't work.** A spoofed beacon has no valid tag, and a recording carries an old counter.
+- A *live* relay (forwarding your phone's packets in real time) is still possible. Stopping that needs distance bounding (BLE Channel Sounding), which the nRF52840 doesn't have.
+
+When the phone sleeps, it keeps sending its last counter, which the dongle
+accepts while it's still seeing you. A wake-up alarm (about once a minute) and
+the screen turning on both advance the counter. **If the LED stays blue when
+you sit back down, wake your phone's screen.**
+
 ---
 
 ## Using it
@@ -60,24 +85,26 @@ Open a text editor and hold the button for 5 s. The dongle types:
 
 ```
 === BLE_Password ===
-fw=1.1.6 board=nrf52840dongle confirmed=1
+fw=1.2.0 board=nrf52840dongle confirmed=1
 up_ms=... scan=1 adv=0 saved=1 hid=1
-ads=... named=... ray=... match=...
-beacon=<beacon name>
+ads=... beacons=... match=... stale=...
+beacon_key=2fcd11b7 ctr=... floor=...
 password=(hidden: phone not in range)
 green=-76 blue=-100 state=RED seen_ago=120
 averaged_rssi=-82
 ```
 
 - Stored credentials are printed **only while the phone is in the green zone**.
+- `beacons` counts rolling beacons from any phone. `match` counts yours, verified and fresh. `stale` counts yours with an old counter (a sleeping phone, or a replay).
+- `beacon_key` is the paired phone's ID. The app shows the same ID.
 - `averaged_rssi` is the running average the zones are based on. It reads `gone` once the beacon hasn't been seen for 5 s.
 - `confirmed=0` means MCUboot will roll back to the previous firmware on the next reset.
 
 ### Configuring with the app
 
 1. Plug in the dongle. It opens a **60 s config window** (blinking blue).
-2. In the app, enter the beacon name, the green and blue thresholds (dBm), and any credentials you want to change.
-3. **Hold the dongle's button** and tap **Save & Send to Dongle**. Writes are only accepted while the button is physically held. That's the proof that whoever is configuring the dongle owns it.
+2. In the app, enter the green and blue thresholds (dBm), and any credentials you want to change.
+3. **Hold the dongle's button** and tap **Save & Send to Dongle**. Writes are only accepted while the button is physically held. That's the proof that whoever is configuring the dongle owns it. The first save also **pairs** the dongle with your phone's beacon key. A dongle that isn't paired never sees any phone. One phone can be paired with several dongles, but each dongle has one phone.
 
 A short tap (< 0.5 s) on the button ends the config window early. It also ends
 when the app disconnects, or after 60 s. Then the dongle starts scanning.
@@ -111,7 +138,7 @@ value". A checkbox removes username 2 and password 2 from the dongle.
 | 0x00000–0x10000 | MCUboot (on the official dongle, the Nordic MBR is at 0x0 and MCUboot at 0x1000) |
 | 0x10000–0x76000 | Slot 0: running app |
 | 0x76000–0xDC000 | Slot 1: update upload target |
-| 0xDC000–0xE0000 | Saved config (raw flash record) |
+| 0xDC000–0xE0000 | Saved config (raw flash record at 0xDC000) + beacon counter log (0xDD000, 0xDE000) |
 | 0xE0000–0x100000 | Official dongle: Nordic bootloader (kept for last-resort recovery) |
 
 ---
@@ -146,8 +173,13 @@ After every change, run:
 powershell -ExecutionPolicy Bypass -File tools\lint.ps1
 ```
 
-This runs clang-tidy on `src/` for both boards, using each build's compile
-database (so build first), and Android Lint on the app.
+This runs:
+- clang-tidy on `src/` for both boards, using each build's compile database (so build first);
+- the host unit tests in `tests/host/` (SHA-256, HMAC, beacon and config-session vectors; needs a host `gcc`);
+- Android Lint and the app's JVM unit tests.
+
+The firmware and app tests share the same beacon test vectors, so both ends
+are checked to agree on the format.
 
 ---
 
@@ -206,7 +238,7 @@ adb install -r app\build\outputs\apk\release\app-release.apk
 
 - The build copies both boards' `dfu_application.zip` from `../build_*` into the APK. Build the firmware first; a missing image only gives a warning. Override the location with `-PfirmwareDir=...`.
 - Release signing reads `~/.android/ble_beacon_keystore.properties`, which you create yourself (`storeFile`, `storePassword`, `keyAlias`, `keyPassword`). Without it the release APK is unsigned. Debug builds work as usual.
-- Backups are disabled (`allowBackup=false`, plus data-extraction rules), and the app stores only the beacon name and thresholds.
+- Backups are disabled (`allowBackup=false`, plus data-extraction rules), and the app stores only the thresholds, its beacon counter, and its beacon key (encrypted under an Android Keystore key). Passwords are never stored.
 
 ---
 
@@ -217,15 +249,23 @@ Service `9f1b0001-5c3a-4e8e-9c2a-1a2b3c4d5e6f`. The dongle advertises as `BLE_Pa
 | UUID suffix | Characteristic | Access |
 |---|---|---|
 | `…0002` | Password 1 (UTF-8) | write* |
-| `…0003` | Beacon name (UTF-8) | write* |
+| `…0003` | *(retired in 1.2.0: was the beacon name)* | |
 | `…0004` | Green threshold (int8 dBm) | write* |
 | `…0005` | Blue threshold (int8 dBm) | write* |
 | `…0006` | DFU arm (`0x01`): unlocks SMP for this phone | write* |
 | `…0007` | Board name (`nrf52840dongle` / `nrf52840dk`) | read |
 | `…0008` | Password 2 (UTF-8, empty = clear) | write* |
 | `…0009` | Username 2 (UTF-8, empty = clear) | write* |
+| `…000A` | Beacon key (16 bytes): pairs the dongle with a phone | write* |
+| `…000B` | Key ID (4 bytes; empty = not paired). The app sends the key only if this doesn't match. | read |
+| `…000C` | Session: read the dongle's ECDH public key, write the phone's (65-byte uncompressed P-256 points) | read / write |
 
 \* Accepted only during the config window **and while the button is held**.
+Password 1, password 2, username 2 and the beacon key must be **sealed** with
+the session (`seq[4] || ciphertext || tag[16]`, see `src/cfg_crypto.h`).
+
+In its config window the dongle advertises manufacturer data
+`FF FF 'B' 'P' 10 <flags>`, where bit 0 of flags means its button is held.
 Values are range-checked (−120…0 dBm, green > blue, non-empty password 1).
 The standard MCUmgr SMP service is also present, but it refuses all commands
 unless DFU has been armed.
@@ -237,7 +277,8 @@ unless DFU has been armed.
 - Passwords are stored **unencrypted** in the dongle's flash. Anyone with the dongle and an SWD debugger (or the MDBT50Q's pads) can read them. Treat the dongle like a key.
 - Builds are signed with **NCS's default MCUboot development key**, which is public. Physical access (the button hold) is what protects updates. For anything serious, generate your own key and set `SB_CONFIG_BOOT_SIGNATURE_KEY_FILE`. After that, MCUboot must be reflashed once on every board.
 - The status dump only reveals credentials while the phone is in range.
-- Proximity comes from signal strength, which an attacker relaying your phone's beacon could fake. This is a convenience tool, not a hardened authenticator.
+- The beacon can't be spoofed or replayed (see *Secure rolling beacon*). A **live relay** can still fake proximity. This is a convenience tool, not a hardened authenticator.
+- The secrets the app sends (passwords, username 2, and the beacon key on first pairing) are **encrypted**. Each connection runs a P-256 ECDH exchange, a fresh phone key against the dongle's per-window key, then derives two keys with HKDF-SHA256. Each secret write is encrypted and authenticated with HMAC-SHA256, bound to its characteristic, and numbered so it can't be replayed (`src/cfg_crypto.h`, `ConfigSession.kt`). The dongle refuses unencrypted secrets. A BLE sniffer sees only ciphertext. The exchange is *unauthenticated*, so an attacker actively relaying the connection during the 60 s window, while you hold the button, could still read it.
 
 ---
 

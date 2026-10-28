@@ -1,4 +1,5 @@
-# Lint the firmware (clang-tidy) and the Android app (Android Lint).
+# Lint + unit-test the firmware (clang-tidy, host tests in tests/host) and the
+# Android app (Android Lint, JVM unit tests).
 #
 #   powershell -File tools\lint.ps1              # both
 #   powershell -File tools\lint.ps1 -Firmware    # clang-tidy only
@@ -49,6 +50,10 @@ if ($Firmware) {
         $out | ForEach-Object { Write-Host $_ }
         if ($LASTEXITCODE -ne 0 -or ($out -match ': (warning|error):')) { $failed = $true }
     }
+
+    Write-Host "=== host unit tests (tests/host) ===" -ForegroundColor Cyan
+    & (Join-Path $repo 'tests\host\run.ps1') | Select-Object -Last 1 | ForEach-Object { Write-Host $_ }
+    if ($LASTEXITCODE -ne 0) { $failed = $true }
 }
 
 if ($Android) {
@@ -59,7 +64,7 @@ if ($Android) {
     } else {
         if (-not $env:JAVA_HOME) { $env:JAVA_HOME = 'C:\Program Files\Android\Android Studio\jbr' }
         Push-Location $AndroidDir
-        & .\gradlew.bat :app:lintRelease -q
+        & .\gradlew.bat :app:lintRelease :app:testDebugUnitTest -q
         if ($LASTEXITCODE -ne 0) { $failed = $true }
         Pop-Location
         Write-Host "Report: $AndroidDir\app\build\reports\lint-results-release.html"

@@ -102,7 +102,9 @@ class MainActivity : ComponentActivity() {
                     autoCorrectEnabled = false,
                     keyboardType = KeyboardType.Password,
                 )
-                var beaconName by remember { mutableStateOf(Config.getBeaconName(context)) }
+                // This phone's beacon fingerprint (matches beacon_key= in the dongle's
+                // status dump). Computing it creates the key on first launch.
+                val beaconId = remember { BeaconKey.idHex(context) }
                 var greenText by remember { mutableStateOf(Config.getGreenThresholdText(context)) }
                 var blueText by remember { mutableStateOf(Config.getBlueThresholdText(context)) }
                 var status by remember { mutableStateOf("") }
@@ -131,8 +133,7 @@ class MainActivity : ComponentActivity() {
                         return
                     }
                     context.startService(Intent(context, BeaconService::class.java))
-                    status = "Beacon started, advertising as " +
-                        "\"${Config.getBeaconNameForAdvertising(context)}\"."
+                    status = "Secure beacon started (ID $beaconId)."
                 }
 
                 fun saveAndSend() {
@@ -149,8 +150,6 @@ class MainActivity : ComponentActivity() {
                             status = "Password 2 too long (max ${Config.PASSWORD_MAX_LEN})."
                         username2.length > Config.PASSWORD_MAX_LEN ->
                             status = "Username 2 too long (max ${Config.PASSWORD_MAX_LEN})."
-                        beaconName.isBlank() || beaconName.length > Config.BEACON_NAME_MAX_LEN ->
-                            status = "Beacon name must be 1–${Config.BEACON_NAME_MAX_LEN} chars."
                         green == null || green !in -120..0 ->
                             status = "Green threshold must be an integer dBm (-120…0)."
                         blue == null || blue !in -120..0 ->
@@ -159,8 +158,8 @@ class MainActivity : ComponentActivity() {
                             status = "Green (close) must be a stronger signal than Blue (far), " +
                                 "e.g. Green -71, Blue -100."
                         else -> {
-                            // Keep advertising the CURRENT (old) name while we write, so the
-                            // dongle — which still uses its booted name — accepts the update.
+                            // Make sure the beacon is on, so the dongle finds this phone
+                            // as soon as its config window closes.
                             context.startService(Intent(context, BeaconService::class.java))
                             sending = true
                             status = "Sending…"
@@ -169,12 +168,7 @@ class MainActivity : ComponentActivity() {
                                 if (done) {
                                     sending = false
                                     if (success) {
-                                        // Persist the non-secret settings, then restart the
-                                        // beacon so it now advertises any new name.
-                                        Config.save(context, beaconName, green, blue)
-                                        context.startService(
-                                            Intent(context, BeaconService::class.java)
-                                        )
+                                        Config.save(context, green, blue)
                                         // The dongle has the credentials now; drop them here.
                                         password = ""
                                         username2 = ""
@@ -182,10 +176,7 @@ class MainActivity : ComponentActivity() {
                                         clearLogin2 = false
                                     }
                                 }
-                            }.send(
-                                password, username2, password2, clearLogin2,
-                                beaconName, green, blue,
-                            )
+                            }.send(password, username2, password2, clearLogin2, green, blue)
                         }
                     }
                 }
@@ -376,15 +367,15 @@ class MainActivity : ComponentActivity() {
 
                         Spacer(Modifier.height(12.dp))
 
-                        OutlinedTextField(
-                            value = beaconName,
-                            onValueChange = { beaconName = it },
-                            label = { Text("Target beacon name") },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth()
+                        Text(
+                            text = "Secure beacon ID: $beaconId. Saving pairs the dongle with " +
+                                "this phone; other people's phones can't trigger it.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 4.dp, bottom = 8.dp)
                         )
-
-                        Spacer(Modifier.height(12.dp))
 
                         Row(modifier = Modifier.fillMaxWidth()) {
                             OutlinedTextField(
@@ -449,7 +440,8 @@ class MainActivity : ComponentActivity() {
                         }
 
                         Text(
-                            text = "Changes take effect after you unplug/replug the dongle.",
+                            text = "Hold the dongle's button while you tap Save (within a " +
+                                "minute of plugging it in).",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(top = 4.dp)

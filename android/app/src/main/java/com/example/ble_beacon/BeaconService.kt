@@ -1,31 +1,60 @@
 package com.example.ble_beacon
 
+import android.annotation.SuppressLint
 import android.app.*
-import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.AdvertiseCallback
 import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
+import android.bluetooth.le.AdvertisingSet
+import android.bluetooth.le.AdvertisingSetCallback
+import android.bluetooth.le.AdvertisingSetParameters
 import android.bluetooth.le.BluetoothLeAdvertiser
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
+import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import androidx.core.content.edit
 
+/**
+ * Broadcasts the authenticated rolling beacon (see [BeaconCrypto]).
+ *
+ * The counter is the wall clock in seconds, never allowed to go backwards. It
+ * is re-signed every second while the CPU is awake. When the phone sleeps the
+ * controller keeps sending the last packet (the dongle accepts a repeated
+ * counter while it can see us), but after the dongle locks it wants a NEWER
+ * one — so an alarm and the screen-on broadcast keep the counter moving while
+ * the phone is asleep.
+ */
+@SuppressLint("MissingPermission") // MainActivity starts us only with BLE permissions granted
 class BeaconService : Service() {
 
-    private var bluetoothLeAdvertiser: BluetoothLeAdvertiser? = null
     private val TAG = "BeaconService"
+    private val main = Handler(Looper.getMainLooper())
+
+    private var advertiser: BluetoothLeAdvertiser? = null
+    private var advertisingSet: AdvertisingSet? = null
+    private var running = false
+    private lateinit var key: ByteArray
+    private var ctr = 0L
+    private var ticksSinceSave = 0
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val beaconName = Config.getBeaconNameForAdvertising(this)
+        key = BeaconKey.get(this)
         createNotificationChannel()
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("BLE Beacon")
-            .setContentText("Advertising as $beaconName")
+            .setContentText("Secure beacon on (ID ${BeaconKey.idHex(this)})")
             .setSmallIcon(R.mipmap.ic_launcher)
             .build()
 
@@ -34,63 +63,158 @@ class BeaconService : Service() {
         } else {
             startForeground(1, notification)
         }
-        
-        startAdvertising()
+
+        if (!running) {
+            running = true
+            ctr = startCounter()
+            startAdvertising()
+            main.post(tickLoop)
+            ContextCompat.registerReceiver(
+                this, wakeReceiver,
+                IntentFilter().apply {
+                    addAction(ACTION_TICK)
+                    addAction(Intent.ACTION_SCREEN_ON)
+                    addAction(Intent.ACTION_USER_PRESENT)
+                },
+                ContextCompat.RECEIVER_NOT_EXPORTED,
+            )
+            scheduleAlarm()
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && advertisingSet == null) {
+            startAdvertising()   // e.g. Bluetooth was off when we first started
+        }
         return START_STICKY
     }
 
-    private fun startAdvertising() {
-        val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-        val bluetoothAdapter = bluetoothManager.adapter
+    // ---- counter ----
 
-        if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
+    private fun prefs() = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    /** Past the last counter we may have sent (saved once a minute). */
+    private fun startCounter(): Long =
+        maxOf(nowSec(), prefs().getLong(KEY_CTR, 0) + SAVE_EVERY_TICKS + 1)
+
+    private fun nowSec() = System.currentTimeMillis() / 1000
+
+    private fun tick() {
+        if (!running) return
+        ctr = maxOf(ctr + 1, nowSec()) and 0xFFFF_FFFFL
+        updateAdvertisingData()
+        if (++ticksSinceSave >= SAVE_EVERY_TICKS) {
+            ticksSinceSave = 0
+            prefs().edit { putLong(KEY_CTR, ctr) }
+        }
+    }
+
+    private val tickLoop = object : Runnable {
+        override fun run() {
+            tick()
+            main.postDelayed(this, 1000)
+        }
+    }
+
+    // Alarm (works while the CPU sleeps) + screen on / unlock.
+    private val wakeReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            tick()
+            if (intent.action == ACTION_TICK) scheduleAlarm()
+        }
+    }
+
+    private fun alarmIntent(): PendingIntent = PendingIntent.getBroadcast(
+        this, 0, Intent(ACTION_TICK).setPackage(packageName),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+    )
+
+    private fun scheduleAlarm() {
+        val am = getSystemService(AlarmManager::class.java) ?: return
+        // Inexact (no special permission); roughly once a minute, also in Doze.
+        am.setAndAllowWhileIdle(
+            AlarmManager.ELAPSED_REALTIME_WAKEUP,
+            SystemClock.elapsedRealtime() + ALARM_INTERVAL_MS,
+            alarmIntent(),
+        )
+    }
+
+    // ---- advertising ----
+
+    private fun advertiseData(): AdvertiseData = AdvertiseData.Builder()
+        .addManufacturerData(BeaconCrypto.COMPANY_ID, BeaconCrypto.beaconPayload(key, ctr))
+        .build()
+
+    private fun startAdvertising() {
+        val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
+        if (adapter == null || !adapter.isEnabled) {
             Log.e(TAG, "Bluetooth not enabled or not supported")
             return
         }
-
-        bluetoothLeAdvertiser = bluetoothAdapter.bluetoothLeAdvertiser
-
-        if (bluetoothLeAdvertiser == null) {
+        advertiser = adapter.bluetoothLeAdvertiser ?: run {
             Log.e(TAG, "Bluetooth LE Advertising not supported")
             return
         }
-
-        // Stop any previous advertising so a restart picks up a changed name.
         try {
-            bluetoothLeAdvertiser?.stopAdvertising(advertiseCallback)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val params = AdvertisingSetParameters.Builder()
+                    .setLegacyMode(true)       // plain advert every scanner understands
+                    .setConnectable(false)
+                    .setScannable(false)
+                    .setInterval(AdvertisingSetParameters.INTERVAL_LOW)  // ~100 ms
+                    .setTxPowerLevel(AdvertisingSetParameters.TX_POWER_HIGH)
+                    .build()
+                val cb = SetCallback().also { setCallback = it }
+                advertiser?.startAdvertisingSet(params, advertiseData(), null, null, null, cb)
+            } else {
+                startLegacy()
+            }
         } catch (e: SecurityException) {
-            Log.e(TAG, "Permission denied to stop advertising", e)
+            Log.e(TAG, "Permission denied to start advertising", e)
         }
+    }
 
+    private fun updateAdvertisingData() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                advertisingSet?.setAdvertisingData(advertiseData())
+            } else {
+                advertiser?.stopAdvertising(legacyCallback)
+                startLegacy()
+            }
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Permission denied to update advertising", e)
+        }
+    }
+
+    // Android 7.x has no AdvertisingSet: restart the advert with the new data.
+    private fun startLegacy() {
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
             .setConnectable(false)
             .setTimeout(0)
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
             .build()
+        advertiser?.startAdvertising(settings, advertiseData(), legacyCallback)
+    }
 
-        val data = AdvertiseData.Builder()
-            .setIncludeDeviceName(true)
-            .build()
-
-        try {
-            bluetoothAdapter.name = Config.getBeaconNameForAdvertising(this)
-        } catch (e: SecurityException) {
-            Log.e(TAG, "Permission denied to set name", e)
+    // AdvertisingSetCallback only exists on Android 8+, so it must not be
+    // instantiated at construction time (that would crash on 7.x).
+    @RequiresApi(Build.VERSION_CODES.O)
+    private inner class SetCallback : AdvertisingSetCallback() {
+        override fun onAdvertisingSetStarted(set: AdvertisingSet?, txPower: Int, status: Int) {
+            if (status == ADVERTISE_SUCCESS) {
+                advertisingSet = set
+                Log.i(TAG, "Secure beacon started")
+            } else {
+                Log.e(TAG, "Advertising set failed: $status")
+            }
         }
 
-        try {
-            bluetoothLeAdvertiser?.startAdvertising(settings, data, advertiseCallback)
-        } catch (e: SecurityException) {
-            Log.e(TAG, "Permission denied to start advertising", e)
+        override fun onAdvertisingSetStopped(set: AdvertisingSet?) {
+            advertisingSet = null
         }
     }
 
-    private val advertiseCallback = object : AdvertiseCallback() {
-        override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
-            Log.i(TAG, "LE Advertise Started.")
-        }
+    private var setCallback: Any? = null   // a SetCallback, on Android 8+
 
+    private val legacyCallback = object : AdvertiseCallback() {
         override fun onStartFailure(errorCode: Int) {
             Log.e(TAG, "LE Advertise Failed: $errorCode")
         }
@@ -98,8 +222,17 @@ class BeaconService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        running = false
+        main.removeCallbacks(tickLoop)
+        runCatching { unregisterReceiver(wakeReceiver) }
+        getSystemService(AlarmManager::class.java)?.cancel(alarmIntent())
+        prefs().edit { putLong(KEY_CTR, ctr) }
         try {
-            bluetoothLeAdvertiser?.stopAdvertising(advertiseCallback)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                (setCallback as? AdvertisingSetCallback)?.let { advertiser?.stopAdvertisingSet(it) }
+            } else {
+                advertiser?.stopAdvertising(legacyCallback)
+            }
         } catch (e: SecurityException) {
             Log.e(TAG, "Permission denied to stop advertising", e)
         }
@@ -121,5 +254,10 @@ class BeaconService : Service() {
 
     companion object {
         const val CHANNEL_ID = "BeaconServiceChannel"
+        private const val PREFS = "ble_password_beacon"
+        private const val KEY_CTR = "last_counter"
+        private const val SAVE_EVERY_TICKS = 60
+        private const val ALARM_INTERVAL_MS = 60_000L
+        private const val ACTION_TICK = "com.example.ble_beacon.BEACON_TICK"
     }
 }

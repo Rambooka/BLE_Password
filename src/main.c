@@ -3,8 +3,9 @@
  *
  * BLE Beacon Proximity Password Typer
  *
- * Scans for a configurable BLE beacon (name set from the companion app) and
- * controls LEDs by RSSI zone (thresholds also configurable):
+ * Scans for the paired phone's authenticated rolling beacon (beacon_auth.h:
+ * HMAC-tagged counter, so other phones and recordings are ignored) and controls
+ * LEDs by RSSI zone (thresholds configurable):
  *   Not detected / RSSI < -100 dBm : Blue  LED solid (phone not seen)
  *   -100 to -71 dBm                : Red   LED solid (phone too far away)
  *   RSSI >= -71 dBm                : Green LED solid (phone beacon is close)
@@ -58,11 +59,15 @@
 #include <string.h>
 #include <stdio.h>
 
+#include <psa/crypto.h>
+
+#include "beacon_auth.h"
+#include "cfg_crypto.h"
+
 LOG_MODULE_REGISTER(ble_password, LOG_LEVEL_INF);
 
 /* ---- Configuration ---------------------------------------------------- */
 
-#define DEFAULT_BEACON_NAME  "Ray's 21 Ultra"
 #define DEFAULT_PASSWORD     "12345678"   /* ENTER is appended automatically */
 
 #define DEFAULT_RSSI_GREEN_THRESHOLD (-71)   /* avg RSSI >= this → GREEN (close:  -10 to -77)  */
@@ -74,7 +79,7 @@ LOG_MODULE_REGISTER(ble_password, LOG_LEVEL_INF);
 #define RSSI_SAMPLES         20      /* number of samples in the running average */
 
 #define PASSWORD_MAX_LEN     64
-#define BEACON_NAME_MAX_LEN  31
+#define BEACON_NAME_MAX_LEN  31      /* only for the (retired) record field */
 
 /* Button press lengths (normal mode, released while GREEN):
  *   < MEDIUM_PRESS_MS                  → type password 1
@@ -96,27 +101,34 @@ LOG_MODULE_REGISTER(ble_password, LOG_LEVEL_INF);
 static char password_str[PASSWORD_MAX_LEN + 1]    = DEFAULT_PASSWORD;
 static char password2_str[PASSWORD_MAX_LEN + 1];   /* optional; "" = not set */
 static char username2_str[PASSWORD_MAX_LEN + 1];   /* optional; typed + TAB before password 2 */
-static char target_beacon_name[BEACON_NAME_MAX_LEN + 1] = DEFAULT_BEACON_NAME;
+/* Rolling-beacon key shared with the owner's phone (see beacon_auth.h).  No key
+ * = no beacon is ever accepted: the dongle stays BLUE until the app pairs it. */
+static uint8_t beacon_key[BEACON_KEY_LEN];
+static bool beacon_key_set;
+static bool beacon_key_changed;   /* new key written this window → reset counters */
 static int8_t rssi_green_threshold = DEFAULT_RSSI_GREEN_THRESHOLD;
 static int8_t rssi_blue_threshold  = DEFAULT_RSSI_BLUE_THRESHOLD;
 
 /* ---- GATT config service UUIDs ----------------------------------------- */
 /* Service:  9f1b0001-5c3a-4e8e-9c2a-1a2b3c4d5e6f
  * Password: 9f1b0002-5c3a-4e8e-9c2a-1a2b3c4d5e6f (write, UTF-8 string)
- * Beacon:   9f1b0003-5c3a-4e8e-9c2a-1a2b3c4d5e6f (write, UTF-8 string)
- * Green th: 9f1b0004-5c3a-4e8e-9c2a-1a2b3c4d5e6f (write, 1 signed byte, dBm)
+ * (0003 was the beacon name; retired in 1.2.0 by the rolling beacon key)
+ * Green th:9f1b0004-5c3a-4e8e-9c2a-1a2b3c4d5e6f (write, 1 signed byte, dBm)
  * Blue th:  9f1b0005-5c3a-4e8e-9c2a-1a2b3c4d5e6f (write, 1 signed byte, dBm)
  * DFU arm:  9f1b0006-5c3a-4e8e-9c2a-1a2b3c4d5e6f (write 0x01 → unlock SMP upload)
  * Board:    9f1b0007-5c3a-4e8e-9c2a-1a2b3c4d5e6f (read, CONFIG_BOARD string)
  * Password2:9f1b0008-5c3a-4e8e-9c2a-1a2b3c4d5e6f (write, UTF-8; empty = clear)
  * Username2:9f1b0009-5c3a-4e8e-9c2a-1a2b3c4d5e6f (write, UTF-8; empty = clear)
+ * BeaconKey:9f1b000a-5c3a-4e8e-9c2a-1a2b3c4d5e6f (write, 16 bytes: rolling-beacon key)
+ * KeyId:    9f1b000b-5c3a-4e8e-9c2a-1a2b3c4d5e6f (read, 4 bytes; empty = no key)
+ * Session:  9f1b000c-5c3a-4e8e-9c2a-1a2b3c4d5e6f (read: dongle's ECDH public key;
+ *           write: phone's) — Password, Password2, Username2 and BeaconKey
+ *           writes must be sealed with the resulting session (cfg_crypto.h).
  */
 #define CFG_SVC_UUID_VAL \
 	BT_UUID_128_ENCODE(0x9f1b0001, 0x5c3a, 0x4e8e, 0x9c2a, 0x1a2b3c4d5e6f)
 #define CFG_PW_UUID_VAL \
 	BT_UUID_128_ENCODE(0x9f1b0002, 0x5c3a, 0x4e8e, 0x9c2a, 0x1a2b3c4d5e6f)
-#define CFG_BEACON_UUID_VAL \
-	BT_UUID_128_ENCODE(0x9f1b0003, 0x5c3a, 0x4e8e, 0x9c2a, 0x1a2b3c4d5e6f)
 #define CFG_GREEN_UUID_VAL \
 	BT_UUID_128_ENCODE(0x9f1b0004, 0x5c3a, 0x4e8e, 0x9c2a, 0x1a2b3c4d5e6f)
 #define CFG_BLUE_UUID_VAL \
@@ -129,16 +141,30 @@ static int8_t rssi_blue_threshold  = DEFAULT_RSSI_BLUE_THRESHOLD;
 	BT_UUID_128_ENCODE(0x9f1b0008, 0x5c3a, 0x4e8e, 0x9c2a, 0x1a2b3c4d5e6f)
 #define CFG_USER2_UUID_VAL \
 	BT_UUID_128_ENCODE(0x9f1b0009, 0x5c3a, 0x4e8e, 0x9c2a, 0x1a2b3c4d5e6f)
+#define CFG_KEY_UUID_VAL \
+	BT_UUID_128_ENCODE(0x9f1b000a, 0x5c3a, 0x4e8e, 0x9c2a, 0x1a2b3c4d5e6f)
+#define CFG_KEYID_UUID_VAL \
+	BT_UUID_128_ENCODE(0x9f1b000b, 0x5c3a, 0x4e8e, 0x9c2a, 0x1a2b3c4d5e6f)
+#define CFG_SESSION_UUID_VAL \
+	BT_UUID_128_ENCODE(0x9f1b000c, 0x5c3a, 0x4e8e, 0x9c2a, 0x1a2b3c4d5e6f)
+
+/* Short IDs bound into each sealed write (low byte of the UUID). */
+#define SEAL_ID_PASSWORD   0x02
+#define SEAL_ID_PASSWORD2  0x08
+#define SEAL_ID_USERNAME2  0x09
+#define SEAL_ID_BEACON_KEY 0x0A
 
 static const struct bt_uuid_128 cfg_svc_uuid    = BT_UUID_INIT_128(CFG_SVC_UUID_VAL);
 static const struct bt_uuid_128 cfg_pw_uuid     = BT_UUID_INIT_128(CFG_PW_UUID_VAL);
-static const struct bt_uuid_128 cfg_beacon_uuid = BT_UUID_INIT_128(CFG_BEACON_UUID_VAL);
 static const struct bt_uuid_128 cfg_green_uuid  = BT_UUID_INIT_128(CFG_GREEN_UUID_VAL);
 static const struct bt_uuid_128 cfg_blue_uuid   = BT_UUID_INIT_128(CFG_BLUE_UUID_VAL);
 static const struct bt_uuid_128 cfg_boot_uuid   = BT_UUID_INIT_128(CFG_BOOT_UUID_VAL);
 static const struct bt_uuid_128 cfg_board_uuid  = BT_UUID_INIT_128(CFG_BOARD_UUID_VAL);
 static const struct bt_uuid_128 cfg_pw2_uuid    = BT_UUID_INIT_128(CFG_PW2_UUID_VAL);
 static const struct bt_uuid_128 cfg_user2_uuid  = BT_UUID_INIT_128(CFG_USER2_UUID_VAL);
+static const struct bt_uuid_128 cfg_key_uuid    = BT_UUID_INIT_128(CFG_KEY_UUID_VAL);
+static const struct bt_uuid_128 cfg_keyid_uuid  = BT_UUID_INIT_128(CFG_KEYID_UUID_VAL);
+static const struct bt_uuid_128 cfg_session_uuid = BT_UUID_INIT_128(CFG_SESSION_UUID_VAL);
 
 /* ---- LEDs --------------------------------------------------------------- */
 /* Official nRF52840 Dongle has 3 LEDs (blue/green/red).  The 3rd-party Raytac
@@ -228,9 +254,21 @@ static bt_addr_le_t dfu_peer;
 
 /* Diagnostics counters */
 static atomic_t scan_total_count;  /* every advertisement seen (any device) */
-static atomic_t scan_match_count;  /* advertisements matching target name */
-static atomic_t scan_named_count;  /* advertisements that carry a name field */
-static atomic_t scan_ray_count;    /* advertisements whose name contains "Ray" */
+static atomic_t scan_fmt_count;    /* rolling beacons from ANY phone (our format) */
+static atomic_t scan_match_count;  /* beacons that verified with our key and were fresh */
+static atomic_t scan_stale_count;  /* verified, but counter not newer (replay / repeat) */
+
+/* Rolling-beacon counter (replay protection).  A beacon is accepted only if its
+ * counter is >= the last accepted one (the phone repeats a value while its CPU
+ * sleeps) AND > the floor.  The floor jumps to the last accepted counter at
+ * every lock (left GREEN / beacon lost), so after the owner walks away only a
+ * NEWER counter brings the dongle back — a recording can't.  The floor is also
+ * persisted (append-only log of uint32 words in two ping-pong pages after the
+ * config record; see ctr_log_*()) so that holds across a reboot. */
+static volatile uint32_t beacon_ctr_last;  /* highest accepted counter */
+static uint32_t beacon_ctr_floor;          /* from flash at boot */
+static volatile uint32_t ctr_logged;       /* highest counter written to flash */
+#define CTR_LOG_INTERVAL_S 300   /* also log every 5 min while the phone is present */
 
 /* ---- RSSI running average (ring buffer, BT thread only) ---------------- */
 
@@ -334,6 +372,7 @@ static void send_key(uint8_t modifier, uint8_t keycode); /* forward declaration 
 static bool ascii_to_hid(char c, uint8_t *mod, uint8_t *key); /* forward decl */
 static void type_string(const char *s); /* forward declaration */
 static void type_full_status(void); /* forward declaration */
+static void ctr_log_request(void);  /* forward declaration */
 
 /* ---- Win+L lock work (runs in system work queue, safe to sleep) -------- */
 
@@ -356,6 +395,11 @@ static void beacon_lost_fn(struct k_work *w)
 	atomic_set(&current_state, STATE_BLUE);
 	LOG_INF("Beacon lost — locking computer");
 	k_work_submit(&lock_work);
+	/* From now on only a NEWER counter counts (a sleeping phone repeats its
+	 * last one, and a recording of it must not unlock anything), and persist
+	 * it so that also holds across a reboot. */
+	beacon_ctr_floor = beacon_ctr_last;
+	ctr_log_request();
 }
 
 K_WORK_DELAYABLE_DEFINE(beacon_lost_work, beacon_lost_fn);
@@ -474,49 +518,60 @@ static void type_string(const char *s)
 
 /* ---- BLE scan ---------------------------------------------------------- */
 
-struct name_parse_ctx {
-	char name[32];
-	bool found;
+struct beacon_parse_ctx {
+	bool     ours;     /* a rolling beacon (any phone's) */
+	bool     valid;    /* ...whose tag verified with our key */
+	uint32_t ctr;
 };
 
-static bool ad_name_cb(struct bt_data *data, void *user_data)
+static bool ad_beacon_cb(struct bt_data *data, void *user_data)
 {
-	struct name_parse_ctx *ctx = user_data;
+	struct beacon_parse_ctx *ctx = user_data;
 
-	if (data->type == BT_DATA_NAME_COMPLETE ||
-	    data->type == BT_DATA_NAME_SHORTENED) {
-		size_t len = MIN((size_t)data->data_len, sizeof(ctx->name) - 1);
-		memcpy(ctx->name, data->data, len);
-		ctx->name[len] = '\0';
-		ctx->found = true;
-		return false; /* stop parsing */
+	if (data->type != BT_DATA_MANUFACTURER_DATA ||
+	    !beacon_auth_is_beacon(data->data, data->data_len)) {
+		return true;   /* keep looking */
 	}
-	return true;
+	ctx->ours = true;
+	ctx->valid = beacon_key_set &&
+		     beacon_auth_verify(beacon_key, data->data, data->data_len, &ctx->ctr);
+	return false;
 }
 
 static void scan_recv(const struct bt_le_scan_recv_info *info,
 		      struct net_buf_simple *buf)
 {
-	struct name_parse_ctx ctx = {0};
+	struct beacon_parse_ctx ctx = {0};
 	struct net_buf_simple_state saved;
 
+	atomic_inc(&scan_total_count);
+	if (!beacon_key_set) {
+		return;   /* not paired with a phone yet */
+	}
+
 	net_buf_simple_save(buf, &saved);
-	bt_data_parse(buf, ad_name_cb, &ctx);
+	bt_data_parse(buf, ad_beacon_cb, &ctx);
 	net_buf_simple_restore(buf, &saved);
 
-	atomic_inc(&scan_total_count);
-	if (ctx.found) {
-		atomic_inc(&scan_named_count);
-		if (strstr(ctx.name, "Ray") != NULL) {
-			atomic_inc(&scan_ray_count);
-		}
-	}
-
-	if (!ctx.found || strcmp(ctx.name, target_beacon_name) != 0) {
+	if (!ctx.ours) {
 		return;
 	}
-
+	atomic_inc(&scan_fmt_count);
+	if (!ctx.valid) {
+		return;   /* another phone's beacon (or a forgery) */
+	}
+	/* Fresh = not older than the newest accepted one (a sleeping phone repeats
+	 * its last counter) and newer than the floor (raised at every lock, restored
+	 * from flash at boot). */
+	if (ctx.ctr <= beacon_ctr_floor || ctx.ctr < beacon_ctr_last) {
+		atomic_inc(&scan_stale_count);
+		return;
+	}
+	beacon_ctr_last = ctx.ctr;
 	atomic_inc(&scan_match_count);
+	if (ctx.ctr - ctr_logged >= CTR_LOG_INTERVAL_S) {
+		ctr_log_request();
+	}
 
 	/* Record that the configured beacon is present (gates config writes). */
 	last_beacon_seen_ms = k_uptime_get();
@@ -552,11 +607,14 @@ static void scan_recv(const struct bt_le_scan_recv_info *info,
 	if (prev_state == STATE_GREEN && new_state != STATE_GREEN) {
 		LOG_INF("Left GREEN (state=%d) — locking computer", new_state);
 		k_work_submit(&lock_work);
+		beacon_ctr_floor = beacon_ctr_last;   /* see beacon_lost_fn */
+		ctr_log_request();
 	}
 
 	k_work_reschedule(&beacon_lost_work, K_MSEC(BEACON_TIMEOUT_MS));
 
-	LOG_DBG("'%s' RSSI=%d avg=%d state=%d", ctx.name, info->rssi, avg, new_state);
+	LOG_DBG("beacon ctr=%u RSSI=%d avg=%d state=%d", ctx.ctr, info->rssi, avg,
+		new_state);
 }
 
 static struct bt_le_scan_cb scan_cbs = {
@@ -576,12 +634,14 @@ static volatile bool cfg_loaded;    /* true if valid config was loaded from flas
  * partition maps (pm_static_*.yml) at 0xDC000 on both boards: after MCUboot's
  * two image slots and, on the official dongle, below the Nordic bootloader
  * (0xE0000).  NVS/settings are not used (see CLAUDE.md). */
-#define CFG_MAGIC      0xB1E50005u
+#define CFG_MAGIC      0xB1E50006u
 /* Older records are a prefix of this layout (fields are only ever appended), so
  * they still load — the missing fields start "not set" — instead of falling
- * back to defaults.  v3 = fw <= 1.1.3 (no password2), v4 = 1.1.4 (no username2). */
+ * back to defaults.  v3 = fw <= 1.1.3 (no password2), v4 = 1.1.4 (no username2),
+ * v5 = 1.1.5-1.1.6 (no beacon key). */
 #define CFG_MAGIC_V3   0xB1E50003u
 #define CFG_MAGIC_V4   0xB1E50004u
+#define CFG_MAGIC_V5   0xB1E50005u
 #define STORAGE_OFFSET PM_CONFIG_STORAGE_ADDRESS
 #define STORAGE_ERASE  4096
 BUILD_ASSERT(PM_CONFIG_STORAGE_ADDRESS == 0xDC000,
@@ -592,9 +652,11 @@ struct persist_cfg {
 	int8_t   green;
 	int8_t   blue;
 	char     password[PASSWORD_MAX_LEN + 1];    /* 65 */
-	char     beacon[BEACON_NAME_MAX_LEN + 1];   /* 32 */
+	char     beacon[BEACON_NAME_MAX_LEN + 1];   /* 32, unused since v6 (was the beacon name) */
 	char     password2[PASSWORD_MAX_LEN + 1];   /* 65, new in v4 */
 	char     username2[PASSWORD_MAX_LEN + 1];   /* 65, new in v5 */
+	uint8_t  beacon_key[BEACON_KEY_LEN];        /* 16, new in v6 */
+	uint8_t  beacon_key_set;                    /* new in v6 */
 };
 
 BUILD_ASSERT(sizeof(struct persist_cfg) % 4 == 0, "persist_cfg must be 4-aligned");
@@ -602,15 +664,13 @@ BUILD_ASSERT(sizeof(struct persist_cfg) % 4 == 0, "persist_cfg must be 4-aligned
 static const struct device *flash_dev =
 	DEVICE_DT_GET(DT_CHOSEN(zephyr_flash_controller));
 
-/* Validate the live config: non-empty password + beacon name, thresholds in a
- * sane dBm window, and green strictly stronger (greater) than blue.  Used to
- * reject bad persisted data on load and bad settings before a flash save. */
+/* Validate the live config: non-empty password, thresholds in a sane dBm
+ * window, and green strictly stronger (greater) than blue.  Used to reject bad
+ * persisted data on load and bad settings before a flash save.  (No beacon key
+ * is valid too: the dongle just never sees its phone until it is paired.) */
 static bool config_is_sane(void)
 {
 	if (password_str[0] == '\0') {
-		return false;
-	}
-	if (target_beacon_name[0] == '\0') {
 		return false;
 	}
 	if (rssi_green_threshold < RSSI_MIN_DBM || rssi_green_threshold > RSSI_MAX_DBM) {
@@ -643,8 +703,12 @@ static void config_load_from_flash(void)
 	if (cfg.magic == CFG_MAGIC_V3) {
 		cfg.password2[0] = '\0';   /* past the end of a v3 record */
 		cfg.username2[0] = '\0';
+		cfg.beacon_key_set = 0;
 	} else if (cfg.magic == CFG_MAGIC_V4) {
 		cfg.username2[0] = '\0';   /* past the end of a v4 record */
+		cfg.beacon_key_set = 0;
+	} else if (cfg.magic == CFG_MAGIC_V5) {
+		cfg.beacon_key_set = 0;    /* past the end of a v5 record */
 	} else if (cfg.magic != CFG_MAGIC) {
 		LOG_INF("No saved config (magic=0x%08x) — using defaults", cfg.magic);
 		return;
@@ -653,19 +717,22 @@ static void config_load_from_flash(void)
 	/* Record fields and live buffers are the same size, so a terminated
 	 * whole-buffer copy is bounded by construction. */
 	BUILD_ASSERT(sizeof(password_str) == sizeof(cfg.password));
-	BUILD_ASSERT(sizeof(target_beacon_name) == sizeof(cfg.beacon));
 	BUILD_ASSERT(sizeof(password2_str) == sizeof(cfg.password2));
 	BUILD_ASSERT(sizeof(username2_str) == sizeof(cfg.username2));
+	BUILD_ASSERT(sizeof(beacon_key) == sizeof(cfg.beacon_key));
 	cfg.password[PASSWORD_MAX_LEN] = '\0';
-	cfg.beacon[BEACON_NAME_MAX_LEN] = '\0';
 	cfg.password2[PASSWORD_MAX_LEN] = '\0';
 	cfg.username2[PASSWORD_MAX_LEN] = '\0';
 	memcpy(password_str, cfg.password, sizeof(password_str));
-	memcpy(target_beacon_name, cfg.beacon, sizeof(target_beacon_name));
 	memcpy(password2_str, cfg.password2, sizeof(password2_str));
 	memcpy(username2_str, cfg.username2, sizeof(username2_str));
+	beacon_key_set = (cfg.beacon_key_set == 1);
+	if (beacon_key_set) {
+		memcpy(beacon_key, cfg.beacon_key, sizeof(beacon_key));
+	}
 	rssi_green_threshold = cfg.green;
 	rssi_blue_threshold = cfg.blue;
+	memset(&cfg, 0, sizeof(cfg));   /* don't leave secrets on the stack */
 
 	/* Guard against corrupt / out-of-range persisted data — fall back to the
 	 * compiled defaults rather than running with nonsense thresholds. */
@@ -674,14 +741,16 @@ static void config_load_from_flash(void)
 		strcpy(password_str, DEFAULT_PASSWORD);
 		password2_str[0] = '\0';
 		username2_str[0] = '\0';
-		strcpy(target_beacon_name, DEFAULT_BEACON_NAME);
+		memset(beacon_key, 0, sizeof(beacon_key));
+		beacon_key_set = false;
 		rssi_green_threshold = DEFAULT_RSSI_GREEN_THRESHOLD;
 		rssi_blue_threshold = DEFAULT_RSSI_BLUE_THRESHOLD;
 		return;
 	}
 
 	cfg_loaded = true;
-	LOG_INF("Loaded config from flash: beacon='%s'", target_beacon_name);
+	LOG_INF("Loaded config from flash (beacon key %s)",
+		beacon_key_set ? "set" : "not set");
 }
 
 /* Save the live config to flash.  Erase+write — MUST be called with the radio
@@ -696,9 +765,10 @@ static void config_save_to_flash(void)
 	cfg.green = rssi_green_threshold;
 	cfg.blue  = rssi_blue_threshold;
 	strncpy(cfg.password, password_str, PASSWORD_MAX_LEN);
-	strncpy(cfg.beacon, target_beacon_name, BEACON_NAME_MAX_LEN);
 	strncpy(cfg.password2, password2_str, PASSWORD_MAX_LEN);
 	strncpy(cfg.username2, username2_str, PASSWORD_MAX_LEN);
+	memcpy(cfg.beacon_key, beacon_key, sizeof(cfg.beacon_key));
+	cfg.beacon_key_set = beacon_key_set ? 1 : 0;
 
 	if (!device_is_ready(flash_dev)) {
 		LOG_ERR("flash device not ready");
@@ -709,7 +779,238 @@ static void config_save_to_flash(void)
 	if (rc == 0) {
 		rc = flash_write(flash_dev, STORAGE_OFFSET, &cfg, sizeof(cfg));
 	}
+	memset(&cfg, 0, sizeof(cfg));
 	LOG_INF("Saved config to flash rc=%d", rc);
+}
+
+/* ---- Beacon counter log (replay protection across reboots) ------------- */
+/* Two 4 KB pages after the config record hold an append-only list of uint32
+ * counters (erased flash = 0xFFFFFFFF = empty slot).  The floor is the largest
+ * value in either page.  When the active page fills, the OTHER page is erased
+ * and written first, so a power cut mid-switch still leaves the old maximum.
+ * ~1 entry per lock event plus one per 5 min of presence → a page lasts days,
+ * far inside the flash's 10k erase cycles. */
+#define CTR_LOG_PAGE_A  (STORAGE_OFFSET + 0x1000)
+#define CTR_LOG_PAGE_B  (STORAGE_OFFSET + 0x2000)
+#define CTR_LOG_WORDS   (STORAGE_ERASE / sizeof(uint32_t))
+#define CTR_EMPTY       0xFFFFFFFFu
+BUILD_ASSERT(STORAGE_OFFSET + 0x3000 <= PM_CONFIG_STORAGE_ADDRESS + PM_CONFIG_STORAGE_SIZE,
+	     "counter log must fit in config_storage");
+
+static off_t ctr_log_page = CTR_LOG_PAGE_A;  /* active page */
+static size_t ctr_log_next;                  /* next free word in it */
+
+/* Scan one page: returns its largest entry and the number of used words. */
+static uint32_t ctr_log_scan(off_t page, size_t *used)
+{
+	uint32_t chunk[64];
+	uint32_t max = 0;
+
+	*used = CTR_LOG_WORDS;
+	for (size_t base = 0; base < CTR_LOG_WORDS; base += ARRAY_SIZE(chunk)) {
+		if (flash_read(flash_dev, page + (off_t)(base * sizeof(uint32_t)),
+			       chunk, sizeof(chunk)) != 0) {
+			*used = 0;
+			return 0;
+		}
+		for (size_t i = 0; i < ARRAY_SIZE(chunk); i++) {
+			if (chunk[i] == CTR_EMPTY) {
+				if (*used == CTR_LOG_WORDS) {
+					*used = base + i;
+				}
+			} else if (chunk[i] > max) {
+				max = chunk[i];
+			}
+		}
+	}
+	return max;
+}
+
+/* Boot: load the floor and pick the page to append to.  Call before bt_enable. */
+static void ctr_log_load(void)
+{
+	size_t used_a, used_b;
+	uint32_t max_a = ctr_log_scan(CTR_LOG_PAGE_A, &used_a);
+	uint32_t max_b = ctr_log_scan(CTR_LOG_PAGE_B, &used_b);
+
+	if (max_b > max_a) {
+		ctr_log_page = CTR_LOG_PAGE_B;
+		ctr_log_next = used_b;
+		beacon_ctr_floor = max_b;
+	} else {
+		ctr_log_page = CTR_LOG_PAGE_A;
+		ctr_log_next = used_a;
+		beacon_ctr_floor = max_a;
+	}
+	ctr_logged = beacon_ctr_floor;
+	beacon_ctr_last = beacon_ctr_floor;
+}
+
+/* New phone key: the old phone's counters mean nothing now.  Radio must be off
+ * (called from the config save path, inside bt_disable()). */
+static void ctr_log_reset(void)
+{
+	(void)flash_erase(flash_dev, CTR_LOG_PAGE_A, STORAGE_ERASE);
+	(void)flash_erase(flash_dev, CTR_LOG_PAGE_B, STORAGE_ERASE);
+	ctr_log_page = CTR_LOG_PAGE_A;
+	ctr_log_next = 0;
+	beacon_ctr_floor = 0;
+	beacon_ctr_last = 0;
+	ctr_logged = 0;
+}
+
+/* Workqueue: append the newest accepted counter if it isn't logged yet.  Flash
+ * uses MPSL radio sync, so this is safe while scanning. */
+static void ctr_log_fn(struct k_work *w)
+{
+	ARG_UNUSED(w);
+	uint32_t v = beacon_ctr_last;
+
+	if (v <= ctr_logged || v == CTR_EMPTY) {
+		return;
+	}
+	if (ctr_log_next >= CTR_LOG_WORDS) {
+		off_t other = (ctr_log_page == CTR_LOG_PAGE_A) ? CTR_LOG_PAGE_B : CTR_LOG_PAGE_A;
+
+		if (flash_erase(flash_dev, other, STORAGE_ERASE) != 0) {
+			return;
+		}
+		ctr_log_page = other;
+		ctr_log_next = 0;
+	}
+	if (flash_write(flash_dev, ctr_log_page + (off_t)(ctr_log_next * sizeof(uint32_t)),
+			&v, sizeof(v)) == 0) {
+		ctr_log_next++;
+		ctr_logged = v;
+	}
+}
+
+K_WORK_DEFINE(ctr_log_work, ctr_log_fn);
+
+static void ctr_log_request(void)
+{
+	k_work_submit(&ctr_log_work);
+}
+
+/* ---- Encrypted config session (ECDH, see cfg_crypto.h) ----------------- */
+/* One dongle key pair per config window; a fresh session (phone key pair →
+ * shared secret → k_enc/k_mac) per connection.  Secret writes are refused
+ * until the session exists. */
+static psa_key_id_t sess_priv;
+static uint8_t sess_pub[CFG_PUB_LEN];
+static bool sess_pub_ok;
+static volatile bool sess_ready;
+static uint8_t sess_enc[CFG_SUBKEY_LEN];
+static uint8_t sess_mac[CFG_SUBKEY_LEN];
+static uint32_t sess_seq;
+
+/* Config window opening: make this window's ECDH key pair (CC310). */
+static void session_keypair_new(void)
+{
+	psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
+	size_t len = 0;
+
+	sess_pub_ok = false;
+	if (psa_crypto_init() != PSA_SUCCESS) {
+		LOG_ERR("psa_crypto_init failed");
+		return;
+	}
+	psa_set_key_type(&attr, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
+	psa_set_key_bits(&attr, 256);
+	psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_DERIVE);
+	psa_set_key_algorithm(&attr, PSA_ALG_ECDH);
+	if (psa_generate_key(&attr, &sess_priv) != PSA_SUCCESS) {
+		LOG_ERR("ECDH key generation failed");
+		return;
+	}
+	if (psa_export_public_key(sess_priv, sess_pub, sizeof(sess_pub), &len) != PSA_SUCCESS ||
+	    len != CFG_PUB_LEN) {
+		LOG_ERR("ECDH public key export failed");
+		(void)psa_destroy_key(sess_priv);
+		return;
+	}
+	sess_pub_ok = true;
+}
+
+static void session_clear(void)
+{
+	sess_ready = false;
+	sess_seq = 0;
+	memset(sess_enc, 0, sizeof(sess_enc));
+	memset(sess_mac, 0, sizeof(sess_mac));
+}
+
+/* Config window closing: forget everything. */
+static void session_keypair_destroy(void)
+{
+	session_clear();
+	if (sess_pub_ok) {
+		(void)psa_destroy_key(sess_priv);
+		sess_pub_ok = false;
+	}
+}
+
+static ssize_t read_session(struct bt_conn *conn,
+			    const struct bt_gatt_attr *attr,
+			    void *buf, uint16_t len, uint16_t offset)
+{
+	return bt_gatt_attr_read(conn, attr, buf, len, offset,
+				 sess_pub, sess_pub_ok ? sizeof(sess_pub) : 0);
+}
+
+/* The phone's public key: run ECDH and derive this connection's keys.  No
+ * button gate needed — it carries no secret; the secret writes stay gated. */
+static ssize_t write_session(struct bt_conn *conn,
+			     const struct bt_gatt_attr *attr,
+			     const void *buf, uint16_t len,
+			     uint16_t offset, uint8_t flags)
+{
+	ARG_UNUSED(conn);
+	ARG_UNUSED(attr);
+	ARG_UNUSED(flags);
+	uint8_t z[CFG_SECRET_LEN];
+	size_t zlen = 0;
+
+	if (!config_mode || !sess_pub_ok) {
+		return BT_GATT_ERR(BT_ATT_ERR_AUTHORIZATION);
+	}
+	if (offset != 0) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+	}
+	if (len != CFG_PUB_LEN || ((const uint8_t *)buf)[0] != 0x04) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+	}
+	session_clear();
+	/* PSA validates that the point is on the curve. */
+	if (psa_raw_key_agreement(PSA_ALG_ECDH, sess_priv, buf, len,
+				  z, sizeof(z), &zlen) != PSA_SUCCESS ||
+	    zlen != sizeof(z)) {
+		LOG_WRN("ECDH failed (bad phone key?)");
+		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+	}
+	cfg_session_derive(z, sess_pub, buf, sess_enc, sess_mac);
+	memset(z, 0, sizeof(z));
+	sess_ready = true;
+	LOG_INF("Config session established");
+	return len;
+}
+
+/* Unseal a secret write into out.  Returns the plaintext length, or a
+ * BT_GATT_ERR (no session, bad tag, replay, too long). */
+static ssize_t open_secret(uint8_t id, const void *buf, uint16_t len,
+			   uint8_t *out, size_t out_max)
+{
+	if (!sess_ready) {
+		LOG_WRN("Secret write rejected: no encrypted session");
+		return BT_GATT_ERR(BT_ATT_ERR_AUTHORIZATION);
+	}
+	int n = cfg_open(sess_enc, sess_mac, id, &sess_seq, buf, len, out, out_max);
+
+	if (n < 0) {
+		LOG_WRN("Secret write rejected: bad seal");
+		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+	}
+	return n;
 }
 
 /* ---- GATT config service ----------------------------------------------- */
@@ -734,22 +1035,31 @@ static ssize_t write_password(struct bt_conn *conn,
 	if (offset != 0) {
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
 	}
-	if (len == 0 || len > PASSWORD_MAX_LEN) {
+
+	uint8_t pt[PASSWORD_MAX_LEN];
+	ssize_t n = open_secret(SEAL_ID_PASSWORD, buf, len, pt, sizeof(pt));
+
+	if (n < 0) {
+		return n;
+	}
+	if (n == 0) {
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 
-	memcpy(password_str, buf, len);
-	password_str[len] = '\0';
+	memcpy(password_str, pt, (size_t)n);
+	password_str[n] = '\0';
+	memset(pt, 0, sizeof(pt));
 	config_dirty = true;
 
-	LOG_INF("Password write accepted (%u chars)", len);
+	LOG_INF("Password write accepted (%d chars)", (int)n);
 	return len;
 }
 
 /* Password 2 and its username (medium press) are optional: an empty write
  * clears them.  `live` is a PASSWORD_MAX_LEN + 1 buffer. */
 static ssize_t write_optional_str(const void *buf, uint16_t len,
-				  uint16_t offset, char *live, const char *what)
+				  uint16_t offset, uint8_t seal_id, char *live,
+				  const char *what)
 {
 	if (!config_mode) {
 		LOG_WRN("%s write rejected: not in config window", what);
@@ -762,15 +1072,20 @@ static ssize_t write_optional_str(const void *buf, uint16_t len,
 	if (offset != 0) {
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
 	}
-	if (len > PASSWORD_MAX_LEN) {
-		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+
+	uint8_t pt[PASSWORD_MAX_LEN];
+	ssize_t n = open_secret(seal_id, buf, len, pt, sizeof(pt));
+
+	if (n < 0) {
+		return n;
 	}
 
-	memcpy(live, buf, len);
-	live[len] = '\0';
+	memcpy(live, pt, (size_t)n);
+	live[n] = '\0';
+	memset(pt, 0, sizeof(pt));
 	config_dirty = true;
 
-	LOG_INF("%s write accepted (%u chars)", what, len);
+	LOG_INF("%s write accepted (%d chars)", what, (int)n);
 	return len;
 }
 
@@ -783,7 +1098,8 @@ static ssize_t write_password2(struct bt_conn *conn,
 	ARG_UNUSED(attr);
 	ARG_UNUSED(flags);
 
-	return write_optional_str(buf, len, offset, password2_str, "Password2");
+	return write_optional_str(buf, len, offset, SEAL_ID_PASSWORD2, password2_str,
+				  "Password2");
 }
 
 static ssize_t write_username2(struct bt_conn *conn,
@@ -795,39 +1111,69 @@ static ssize_t write_username2(struct bt_conn *conn,
 	ARG_UNUSED(attr);
 	ARG_UNUSED(flags);
 
-	return write_optional_str(buf, len, offset, username2_str, "Username2");
+	return write_optional_str(buf, len, offset, SEAL_ID_USERNAME2, username2_str,
+				  "Username2");
 }
 
-static ssize_t write_beacon(struct bt_conn *conn,
-			    const struct bt_gatt_attr *attr,
-			    const void *buf, uint16_t len,
-			    uint16_t offset, uint8_t flags)
+/* Pair with a phone: its 16-byte rolling-beacon key.  Same physical gate as
+ * every other write.  The app only sends it when the key-ID read shows the
+ * dongle doesn't already hold this phone's key. */
+static ssize_t write_beacon_key(struct bt_conn *conn,
+				const struct bt_gatt_attr *attr,
+				const void *buf, uint16_t len,
+				uint16_t offset, uint8_t flags)
 {
 	ARG_UNUSED(conn);
 	ARG_UNUSED(attr);
 	ARG_UNUSED(flags);
 
 	if (!config_mode) {
-		LOG_WRN("Beacon-name write rejected: not in config window");
+		LOG_WRN("Beacon-key write rejected: not in config window");
 		return BT_GATT_ERR(BT_ATT_ERR_AUTHORIZATION);
 	}
 	if (!button_held) {
-		LOG_WRN("Beacon-name write rejected: button not held");
+		LOG_WRN("Beacon-key write rejected: button not held");
 		return BT_GATT_ERR(BT_ATT_ERR_AUTHORIZATION);
 	}
 	if (offset != 0) {
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
 	}
-	if (len == 0 || len > BEACON_NAME_MAX_LEN) {
+
+	uint8_t key[BEACON_KEY_LEN];
+	ssize_t n = open_secret(SEAL_ID_BEACON_KEY, buf, len, key, sizeof(key));
+
+	if (n < 0) {
+		return n;
+	}
+	if (n != BEACON_KEY_LEN) {
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 
-	memcpy(target_beacon_name, buf, len);
-	target_beacon_name[len] = '\0';
+	if (!beacon_key_set || memcmp(beacon_key, key, BEACON_KEY_LEN) != 0) {
+		beacon_key_changed = true;
+	}
+	memcpy(beacon_key, key, BEACON_KEY_LEN);
+	memset(key, 0, sizeof(key));
+	beacon_key_set = true;
 	config_dirty = true;
 
-	LOG_INF("Beacon-name write accepted '%s'", target_beacon_name);
+	LOG_INF("Beacon key written");
 	return len;
+}
+
+/* Non-secret ID of the stored key (empty when unpaired), so the app can skip
+ * re-sending a key the dongle already has.  No gate: it reveals nothing. */
+static ssize_t read_key_id(struct bt_conn *conn,
+			   const struct bt_gatt_attr *attr,
+			   void *buf, uint16_t len, uint16_t offset)
+{
+	uint8_t id[BEACON_KEY_ID_LEN] = {0};
+
+	if (!beacon_key_set) {
+		return bt_gatt_attr_read(conn, attr, buf, len, offset, id, 0);
+	}
+	beacon_auth_key_id(beacon_key, id);
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, id, sizeof(id));
 }
 
 static ssize_t write_threshold(struct bt_conn *conn,
@@ -963,10 +1309,6 @@ BT_GATT_SERVICE_DEFINE(cfg_svc,
 			       BT_GATT_CHRC_WRITE,
 			       BT_GATT_PERM_WRITE,
 			       NULL, write_password, NULL),
-	BT_GATT_CHARACTERISTIC(&cfg_beacon_uuid.uuid,
-			       BT_GATT_CHRC_WRITE,
-			       BT_GATT_PERM_WRITE,
-			       NULL, write_beacon, NULL),
 	BT_GATT_CHARACTERISTIC(&cfg_green_uuid.uuid,
 			       BT_GATT_CHRC_WRITE,
 			       BT_GATT_PERM_WRITE,
@@ -991,13 +1333,35 @@ BT_GATT_SERVICE_DEFINE(cfg_svc,
 			       BT_GATT_CHRC_WRITE,
 			       BT_GATT_PERM_WRITE,
 			       NULL, write_username2, NULL),
+	BT_GATT_CHARACTERISTIC(&cfg_key_uuid.uuid,
+			       BT_GATT_CHRC_WRITE,
+			       BT_GATT_PERM_WRITE,
+			       NULL, write_beacon_key, NULL),
+	BT_GATT_CHARACTERISTIC(&cfg_keyid_uuid.uuid,
+			       BT_GATT_CHRC_READ,
+			       BT_GATT_PERM_READ,
+			       read_key_id, NULL, NULL),
+	BT_GATT_CHARACTERISTIC(&cfg_session_uuid.uuid,
+			       BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
+			       BT_GATT_PERM_READ | BT_GATT_PERM_WRITE,
+			       read_session, write_session, NULL),
 );
 
 /* ---- Connectable advertising ------------------------------------------- */
 
+/* Manufacturer data in the config-window advert: FF FF 'B' 'P' 10 <flags>.
+ * flags bit 0 = button held right now.  With several dongles in config mode
+ * nearby (an office), the app connects only to the one whose owner is holding
+ * its button, instead of the first one it hears. */
+#define CFG_ADV_TYPE      0x10
+#define CFG_ADV_HELD      0x01
+static uint8_t adv_mfg[] = { 0xFF, 0xFF, BEACON_MAGIC0, BEACON_MAGIC1,
+			     CFG_ADV_TYPE, 0x00 };
+
 static const struct bt_data adv_ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
 	BT_DATA_BYTES(BT_DATA_UUID128_ALL, CFG_SVC_UUID_VAL),
+	BT_DATA(BT_DATA_MANUFACTURER_DATA, adv_mfg, sizeof(adv_mfg)),
 };
 
 static const struct bt_data adv_sd[] = {
@@ -1040,6 +1404,22 @@ static void adv_restart_fn(struct k_work *w)
 
 K_WORK_DEFINE(adv_restart_work, adv_restart_fn);
 
+/* Button pressed/released in the config window: refresh the "held" flag in the
+ * advert (from the workqueue — the button callback runs in interrupt context).
+ * While connected the controller isn't advertising and the update just fails;
+ * the flag is still current for the next (DFU) restart. */
+static void adv_flag_fn(struct k_work *w)
+{
+	ARG_UNUSED(w);
+	adv_mfg[5] = button_held ? CFG_ADV_HELD : 0;
+	if (config_mode && ble_adv_running) {
+		(void)bt_le_adv_update_data(adv_ad, ARRAY_SIZE(adv_ad),
+					    adv_sd, ARRAY_SIZE(adv_sd));
+	}
+}
+
+K_WORK_DEFINE(adv_flag_work, adv_flag_fn);
+
 static void on_connected(struct bt_conn *conn, uint8_t err)
 {
 	if (err) {
@@ -1065,6 +1445,7 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	ARG_UNUSED(conn);
 	cfg_conn = NULL;
+	session_clear();   /* a new connection must do its own ECDH */
 	LOG_INF("Config client disconnected (0x%02x)", reason);
 	if (!config_mode) {
 		return;
@@ -1125,6 +1506,7 @@ static void button_cb(struct input_event *evt, void *user_data)
 				k_sem_give(&config_done_sem);
 			}
 		}
+		k_work_submit(&adv_flag_work);
 		return;
 	}
 
@@ -1383,6 +1765,7 @@ static void ble_init_thread_fn(void *a, void *b, void *c)
 	/* LOAD persisted config BEFORE bt_enable(), i.e. with the radio fully off
 	 * (flash is un-synced).  Read-only, so it cannot hang. */
 	config_load_from_flash();
+	ctr_log_load();
 
 	/* MCUboot: if this image was just installed as a test swap, mark it good
 	 * now that it has booted this far.  If it crashes before reaching here,
@@ -1404,6 +1787,7 @@ static void ble_init_thread_fn(void *a, void *b, void *c)
 	/* ---- CONFIG WINDOW: advertise connectable so the app can connect and
 	 * write settings (applied live).  No scanning during this window — this
 	 * controller won't do connectable-advertising + scanning together. */
+	session_keypair_new();
 	config_mode = true;
 	ble_adv_err = start_advertising();
 	ble_adv_running = (ble_adv_err == 0);
@@ -1430,6 +1814,7 @@ static void ble_init_thread_fn(void *a, void *b, void *c)
 
 	config_mode = false;
 	dfu_armed = false;
+	session_keypair_destroy();
 	if (ble_adv_running) {
 		bt_le_adv_stop();
 		ble_adv_running = false;
@@ -1463,6 +1848,10 @@ static void ble_init_thread_fn(void *a, void *b, void *c)
 		} else {
 			bt_disable();
 			config_save_to_flash();
+			if (beacon_key_changed) {
+				beacon_key_changed = false;
+				ctr_log_reset();
+			}
 			ret = bt_enable(NULL);
 			if (ret) {
 				LOG_ERR("BLE re-enable failed (%d)", ret);
@@ -1495,11 +1884,12 @@ static void ble_init_thread_fn(void *a, void *b, void *c)
 	}
 	ble_scan_running = (ret == 0);
 
-	LOG_INF("BLE Password initialized — scanning for '%s'", target_beacon_name);
+	LOG_INF("BLE Password initialized — scanning for the paired phone (key %s)",
+		beacon_key_set ? "set" : "NOT set");
 }
 
 /* NOLINTNEXTLINE(bugprone-branch-clone,misc-misplaced-const): Zephyr macro internals */
-K_THREAD_DEFINE(ble_init_tid, 2048, ble_init_thread_fn, NULL, NULL, NULL,
+K_THREAD_DEFINE(ble_init_tid, 4096, ble_init_thread_fn,   /* 4 KB: ECDH keygen */ NULL, NULL, NULL,
 		7, 0, 0);
 
 /* ---- HID status dump (triggered by 5-second button hold) --------------- */
@@ -1529,13 +1919,25 @@ static void type_full_status(void)
 		 (long long)k_uptime_get(), (int)ble_scan_running,
 		 (int)ble_adv_running, (int)cfg_loaded, (int)hid_ready);
 	type_string(line);
-	snprintf(line, sizeof(line), "ads=%ld named=%ld ray=%ld match=%ld\n",
+	/* ads = everything heard; beacons = rolling beacons from any phone;
+	 * match = ours, verified + fresh; stale = ours but an old counter. */
+	snprintf(line, sizeof(line), "ads=%ld beacons=%ld match=%ld stale=%ld\n",
 		 (long)atomic_get(&scan_total_count),
-		 (long)atomic_get(&scan_named_count),
-		 (long)atomic_get(&scan_ray_count),
-		 (long)atomic_get(&scan_match_count));
+		 (long)atomic_get(&scan_fmt_count),
+		 (long)atomic_get(&scan_match_count),
+		 (long)atomic_get(&scan_stale_count));
 	type_string(line);
-	snprintf(line, sizeof(line), "beacon=%s\n", target_beacon_name);
+	if (beacon_key_set) {
+		uint8_t id[BEACON_KEY_ID_LEN];
+
+		beacon_auth_key_id(beacon_key, id);
+		snprintf(line, sizeof(line),
+			 "beacon_key=%02x%02x%02x%02x ctr=%lu floor=%lu\n",
+			 id[0], id[1], id[2], id[3],
+			 (unsigned long)beacon_ctr_last, (unsigned long)beacon_ctr_floor);
+	} else {
+		snprintf(line, sizeof(line), "beacon_key=(not set: pair from the app)\n");
+	}
 	type_string(line);
 	/* Same rule as typing the password: only reveal it while the owner's
 	 * phone is in range (GREEN). */

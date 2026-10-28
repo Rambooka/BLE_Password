@@ -15,7 +15,7 @@ object Config {
     // ---- GATT config service / characteristic UUIDs (match firmware) ----
     val SERVICE_UUID: UUID = UUID.fromString("9f1b0001-5c3a-4e8e-9c2a-1a2b3c4d5e6f")
     val PASSWORD_UUID: UUID = UUID.fromString("9f1b0002-5c3a-4e8e-9c2a-1a2b3c4d5e6f")
-    val BEACON_NAME_UUID: UUID = UUID.fromString("9f1b0003-5c3a-4e8e-9c2a-1a2b3c4d5e6f")
+    // (…0003 was the beacon name; replaced by the rolling-beacon key in fw 1.2.0.)
     val GREEN_THRESHOLD_UUID: UUID = UUID.fromString("9f1b0004-5c3a-4e8e-9c2a-1a2b3c4d5e6f")
     val BLUE_THRESHOLD_UUID: UUID = UUID.fromString("9f1b0005-5c3a-4e8e-9c2a-1a2b3c4d5e6f")
 
@@ -32,24 +32,27 @@ object Config {
     // Username typed before Password 2, then TAB (firmware 1.1.5+). Empty = clear it.
     val USERNAME2_UUID: UUID = UUID.fromString("9f1b0009-5c3a-4e8e-9c2a-1a2b3c4d5e6f")
 
+    // Write: this phone's 16-byte rolling-beacon key (fw 1.2.0+). Read KEY_ID
+    // first and only write when the dongle doesn't already hold this key.
+    val BEACON_KEY_UUID: UUID = UUID.fromString("9f1b000a-5c3a-4e8e-9c2a-1a2b3c4d5e6f")
+    // Read: 4-byte fingerprint of the dongle's key (empty = not paired).
+    val KEY_ID_UUID: UUID = UUID.fromString("9f1b000b-5c3a-4e8e-9c2a-1a2b3c4d5e6f")
+    // Read: the dongle's ECDH public key; write: ours (see ConfigSession). The
+    // passwords and the beacon key are only accepted sealed with that session.
+    val SESSION_UUID: UUID = UUID.fromString("9f1b000c-5c3a-4e8e-9c2a-1a2b3c4d5e6f")
+
     // The dongle's advertised name (CONFIG_BT_DEVICE_NAME in firmware).
     const val DONGLE_NAME = "BLE_Password"
 
     // ---- Defaults (match firmware compiled defaults) ----
-    const val DEFAULT_BEACON_NAME = "Ray's 21 Ultra"
     const val DEFAULT_PASSWORD = "12345678"
     const val DEFAULT_GREEN_THRESHOLD = -71
     const val DEFAULT_BLUE_THRESHOLD = -100
 
-    // Name the phone advertises when the user hasn't set a beacon name yet.
-    const val FALLBACK_BEACON_NAME = "Default"
-
     // ---- Firmware limits (match firmware) ----
     const val PASSWORD_MAX_LEN = 64
-    const val BEACON_NAME_MAX_LEN = 31
 
     private const val PREFS = "ble_password_cfg"
-    private const val KEY_BEACON = "beacon_name"
     private const val KEY_GREEN = "green_threshold"
     private const val KEY_BLUE = "blue_threshold"
 
@@ -74,17 +77,6 @@ object Config {
     // UI fields start blank (the user fills them in), rather than pre-filling the
     // firmware defaults.
 
-    fun getBeaconName(ctx: Context): String =
-        prefs(ctx).getString(KEY_BEACON, "") ?: ""
-
-    /**
-     * Name to actually advertise. Falls back to [FALLBACK_BEACON_NAME] when the
-     * user hasn't set one, so the phone never broadcasts a blank name (which
-     * would also wipe the phone's global Bluetooth name).
-     */
-    fun getBeaconNameForAdvertising(ctx: Context): String =
-        getBeaconName(ctx).ifBlank { FALLBACK_BEACON_NAME }
-
     /** Threshold as text for the UI: "" when not previously set. */
     fun getGreenThresholdText(ctx: Context): String =
         if (prefs(ctx).contains(KEY_GREEN)) prefs(ctx).getInt(KEY_GREEN, 0).toString() else ""
@@ -92,10 +84,10 @@ object Config {
     fun getBlueThresholdText(ctx: Context): String =
         if (prefs(ctx).contains(KEY_BLUE)) prefs(ctx).getInt(KEY_BLUE, 0).toString() else ""
 
-    /** Persist the non-secret settings (the beacon needs them to advertise). */
-    fun save(ctx: Context, beaconName: String, green: Int, blue: Int) {
+    /** Persist the non-secret settings (so the form shows them next time). */
+    fun save(ctx: Context, green: Int, blue: Int) {
         prefs(ctx).edit()
-            .putString(KEY_BEACON, beaconName)
+            .remove("beacon_name")   // pre-1.2 setting, no longer used
             .putInt(KEY_GREEN, green)
             .putInt(KEY_BLUE, blue)
             .apply()

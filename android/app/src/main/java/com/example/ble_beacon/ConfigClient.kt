@@ -21,8 +21,12 @@ import java.util.UUID
 
 /**
  * One-shot BLE client that finds the dongle (by its config service UUID),
- * connects, and writes the password / beacon name / RSSI thresholds, then
- * disconnects. All writes are sequential (BLE allows one outstanding op).
+ * connects, pairs it with this phone's beacon key if needed, and writes the
+ * passwords / RSSI thresholds, then disconnects. All GATT operations are
+ * sequential (BLE allows one outstanding op).
+ *
+ * With several dongles in their config window nearby (an office), it connects
+ * only to the one advertising "button held" — the one its owner is holding.
  *
  * Progress is reported via [listener] on the main thread.
  */
@@ -44,19 +48,45 @@ class ConfigClient(
     private var dfuBoard: String? = null
     private var onDfuArmed: ((BluetoothDevice) -> Unit)? = null
 
-    // Queue of (characteristic UUID -> value) to write in order. An [optional]
-    // item is skipped when the dongle's firmware doesn't have that characteristic.
-    private data class WriteItem(
+    // Queue of (characteristic UUID -> value) to write in order. A [sealId]
+    // item is a secret: encrypted with the session just before sending.
+    private class WriteItem(
         val uuid: UUID,
         val value: ByteArray,
-        val optional: Boolean = false,
+        val sealId: Int? = null,
     )
     private val writeQueue = ArrayDeque<WriteItem>()
+
+    // Encrypted session for this connection (settings path only).
+    private var session: ConfigSession? = null
+
+    // Set when this save also pairs the dongle with this phone's beacon key.
+    private var pairing = false
+
+    // A dongle whose button ISN'T held was seen (someone else's, or not held yet).
+    private var sawUnheldDongle = false
+
+    // Firmware older than 1.2 doesn't advertise the button flag. If that's the
+    // only kind of dongle around, connect to it after a short wait (so its
+    // firmware can still be updated).
+    private var legacyCandidate: BluetoothDevice? = null
+    private val legacyFallback = Runnable {
+        val dev = legacyCandidate
+        if (dev != null && gatt == null && !finished) connect(dev)
+    }
 
     private val scanTimeout = Runnable {
         if (gatt == null && !finished) {
             stopScan()
-            finish("Dongle not found. Is it powered and in range?", false)
+            finish(
+                if (sawUnheldDongle) {
+                    "Found a dongle, but its button isn't held. Hold the button, " +
+                        "then try again."
+                } else {
+                    "Dongle not found. Is it powered and in its config window?"
+                },
+                false,
+            )
         }
     }
 
@@ -79,27 +109,33 @@ class ConfigClient(
      */
     fun send(
         password: String, username2: String, password2: String, clearLogin2: Boolean,
-        beaconName: String, green: Int, blue: Int,
+        green: Int, blue: Int,
     ) {
         dfuBoard = null
         writeQueue.clear()
         if (password.isNotEmpty()) {
-            writeQueue.add(WriteItem(Config.PASSWORD_UUID, password.toByteArray(Charsets.UTF_8)))
+            writeQueue.add(
+                WriteItem(Config.PASSWORD_UUID, password.toByteArray(Charsets.UTF_8),
+                    sealId = ConfigSession.ID_PASSWORD)
+            )
         }
-        // Older firmware has no password 2 (<= 1.1.3) / username 2 (<= 1.1.4):
-        // clearing is then a no-op (optional), but setting one must fail.
         if (clearLogin2) {
-            writeQueue.add(WriteItem(Config.PASSWORD2_UUID, ByteArray(0), optional = true))
-            writeQueue.add(WriteItem(Config.USERNAME2_UUID, ByteArray(0), optional = true))
+            writeQueue.add(WriteItem(Config.PASSWORD2_UUID, ByteArray(0), sealId = ConfigSession.ID_PASSWORD2))
+            writeQueue.add(WriteItem(Config.USERNAME2_UUID, ByteArray(0), sealId = ConfigSession.ID_USERNAME2))
         } else {
             if (password2.isNotEmpty()) {
-                writeQueue.add(WriteItem(Config.PASSWORD2_UUID, password2.toByteArray(Charsets.UTF_8)))
+                writeQueue.add(
+                    WriteItem(Config.PASSWORD2_UUID, password2.toByteArray(Charsets.UTF_8),
+                        sealId = ConfigSession.ID_PASSWORD2)
+                )
             }
             if (username2.isNotEmpty()) {
-                writeQueue.add(WriteItem(Config.USERNAME2_UUID, username2.toByteArray(Charsets.UTF_8)))
+                writeQueue.add(
+                    WriteItem(Config.USERNAME2_UUID, username2.toByteArray(Charsets.UTF_8),
+                        sealId = ConfigSession.ID_USERNAME2)
+                )
             }
         }
-        writeQueue.add(WriteItem(Config.BEACON_NAME_UUID, beaconName.toByteArray(Charsets.UTF_8)))
         writeQueue.add(WriteItem(Config.GREEN_THRESHOLD_UUID, byteArrayOf(green.toByte())))
         writeQueue.add(WriteItem(Config.BLUE_THRESHOLD_UUID, byteArrayOf(blue.toByte())))
         beginScan()
@@ -156,11 +192,17 @@ class ConfigClient(
             val device = result.device ?: return
             if (gatt != null || finished) return
             if (!isDongle(result)) return
-            Log.i(tag, "Found dongle ${device.address}, connecting")
-            stopScan()
-            report("Connecting…")
-            this@ConfigClient.device = device
-            gatt = device.connectGatt(context, false, gattCallback)
+            val held = BeaconCrypto.dongleButtonHeld(
+                result.scanRecord?.getManufacturerSpecificData(BeaconCrypto.COMPANY_ID)
+            )
+            when (held) {
+                true -> connect(device)
+                false -> sawUnheldDongle = true
+                null -> if (legacyCandidate == null) {
+                    legacyCandidate = device
+                    main.postDelayed(legacyFallback, 3_000)
+                }
+            }
         }
 
         override fun onScanFailed(errorCode: Int) {
@@ -168,8 +210,17 @@ class ConfigClient(
         }
     }
 
+    private fun connect(device: BluetoothDevice) {
+        Log.i(tag, "Found dongle ${device.address}, connecting")
+        stopScan()
+        report("Connecting…")
+        this.device = device
+        gatt = device.connectGatt(context, false, gattCallback)
+    }
+
     private fun stopScan() {
         main.removeCallbacks(scanTimeout)
+        main.removeCallbacks(legacyFallback)
         try {
             scanner?.stopScan(scanCallback)
         } catch (_: Exception) {
@@ -217,8 +268,20 @@ class ConfigClient(
                 }
                 return
             }
-            report("Writing settings…")
-            writeNext()
+            // Settings: first check whether the dongle already has our key.
+            val keyIdCh = service.getCharacteristic(Config.KEY_ID_UUID)
+            if (keyIdCh == null || service.getCharacteristic(Config.SESSION_UUID) == null) {
+                finish(
+                    "This dongle's firmware is older than 1.2 (no secure beacon). " +
+                        "Update the dongle firmware first.",
+                    false,
+                )
+                return
+            }
+            report("Checking pairing…")
+            if (!g.readCharacteristic(keyIdCh)) {
+                finish("Failed to read the dongle's pairing.", false)
+            }
         }
 
         override fun onCharacteristicRead(
@@ -227,7 +290,7 @@ class ConfigClient(
             value: ByteArray,
             status: Int,
         ) {
-            onBoardRead(value, status)
+            onRead(characteristic.uuid, value, status)
         }
 
         @Deprecated("Used below Android 13")
@@ -238,7 +301,7 @@ class ConfigClient(
             status: Int,
         ) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-                onBoardRead(characteristic.value ?: ByteArray(0), status)
+                onRead(characteristic.uuid, characteristic.value ?: ByteArray(0), status)
             }
         }
 
@@ -260,6 +323,52 @@ class ConfigClient(
             }
             writeNext()
         }
+    }
+
+    private fun onRead(uuid: UUID, value: ByteArray, status: Int) {
+        when (uuid) {
+            Config.BOARD_UUID -> onBoardRead(value, status)
+            Config.KEY_ID_UUID -> onKeyIdRead(value, status)
+            Config.SESSION_UUID -> onSessionRead(value, status)
+        }
+    }
+
+    // Send our beacon key only if the dongle doesn't hold it already, so the
+    // key goes over the air once per dongle, not on every save. Then set up
+    // the encrypted session.
+    private fun onKeyIdRead(value: ByteArray, status: Int) {
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            finish("Failed to read the dongle's pairing (status $status).", false)
+            return
+        }
+        val key = BeaconKey.get(context)
+        if (!value.contentEquals(BeaconCrypto.keyId(key))) {
+            pairing = true
+            writeQueue.addFirst(WriteItem(Config.BEACON_KEY_UUID, key, sealId = ConfigSession.ID_BEACON_KEY))
+        }
+        val g = gatt ?: return
+        val ch = g.getService(Config.SERVICE_UUID)?.getCharacteristic(Config.SESSION_UUID)
+        report("Securing the connection…")
+        if (ch == null || !g.readCharacteristic(ch)) {
+            finish("Failed to start the encrypted session.", false)
+        }
+    }
+
+    // The dongle's ECDH public key: derive the session, send ours first, then
+    // the (sealed) settings.
+    private fun onSessionRead(value: ByteArray, status: Int) {
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            finish("Failed to read the dongle's session key (status $status).", false)
+            return
+        }
+        val s = runCatching { ConfigSession.start(value) }.getOrElse {
+            finish("The dongle sent an invalid session key. Replug it and try again.", false)
+            return
+        }
+        session = s
+        writeQueue.addFirst(WriteItem(Config.SESSION_UUID, s.phonePublicKey))
+        report("Writing settings…")
+        writeNext()
     }
 
     private fun onBoardRead(value: ByteArray, status: Int) {
@@ -284,40 +393,42 @@ class ConfigClient(
         if (item == null) {
             if (dfuBoard != null) {
                 finish("Update armed — you can release the button.", true)
+            } else if (pairing) {
+                finish(
+                    "Saved, and the dongle is now paired with this phone's beacon. " +
+                        "It blinks green 3× once stored.",
+                    true,
+                )
             } else {
-                finish("Saved to dongle. Power-cycle it to apply.", true)
+                finish("Saved to dongle. It blinks green 3× once stored.", true)
             }
             return
         }
         val service = g.getService(Config.SERVICE_UUID)
         val ch = service?.getCharacteristic(item.uuid)
         if (ch == null) {
-            when {
-                item.optional -> writeNext()
-                item.uuid == Config.PASSWORD2_UUID -> finish(
-                    "This dongle's firmware has no Password 2. Update the dongle " +
-                        "firmware first.",
-                    false,
-                )
-                item.uuid == Config.USERNAME2_UUID -> finish(
-                    "This dongle's firmware has no Username 2. Update the dongle " +
-                        "firmware first.",
-                    false,
-                )
-                else -> finish("Characteristic ${item.uuid} missing.", false)
-            }
+            // Settings need fw 1.2.0+ (checked up front), which has them all.
+            finish("Characteristic ${item.uuid} missing.", false)
             return
         }
 
+        val value = item.sealId?.let { id ->
+            val s = session ?: run {
+                finish("No encrypted session; not sending secrets.", false)
+                return
+            }
+            s.seal(id, item.value)
+        } ?: item.value
+
         val ok: Boolean = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             g.writeCharacteristic(
-                ch, item.value, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                ch, value, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
             ) == BluetoothStatusCodes.SUCCESS
         } else {
             @Suppress("DEPRECATION")
             run {
                 ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                ch.value = item.value
+                ch.value = value
                 g.writeCharacteristic(ch)
             }
         }
