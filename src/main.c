@@ -1543,9 +1543,16 @@ static void type_full_status(void)
 		snprintf(line, sizeof(line), "password=(hidden: phone not in range)\n");
 	}
 	type_string(line);
-	snprintf(line, sizeof(line), "green=%d blue=%d state=%s rssi=%d seen_ago=%lld\n",
-		 rssi_green_threshold, rssi_blue_threshold, stn,
-		 (int)rssi_last_avg, (long long)since);
+	snprintf(line, sizeof(line), "green=%d blue=%d state=%s seen_ago=%lld\n",
+		 rssi_green_threshold, rssi_blue_threshold, stn, (long long)since);
+	type_string(line);
+	/* "averaged_" so it isn't mistaken for a setting.  Once the beacon has
+	 * timed out the last average is stale, so say "gone" instead. */
+	if (since >= BEACON_TIMEOUT_MS) {
+		snprintf(line, sizeof(line), "averaged_rssi=gone\n");
+	} else {
+		snprintf(line, sizeof(line), "averaged_rssi=%d\n", (int)rssi_last_avg);
+	}
 	type_string(line);
 }
 
