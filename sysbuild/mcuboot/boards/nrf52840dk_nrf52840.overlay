@@ -1,0 +1,6 @@
+/* MCUboot on the Raytac MDBT50Q-RX (built as nrf52840dk): P0.18 (nRESET) is
+ * tied to P0.19 on this board, so never make P0.18 a reset pin, and drop the
+ * DK's QSPI flash (SCK on P0.19). See boards/nrf52840dk_nrf52840.overlay. */
+&qspi { status = "disabled"; };
+&mx25r64 { status = "disabled"; };
+&uicr { /delete-property/ gpio-as-nreset; };

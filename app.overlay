@@ -1,0 +1,17 @@
+/*
+ * LEDs and button use the nRF52840 Dongle board aliases directly:
+ *   led0  = green single LED  (P0.06)
+ *   led1  = RGB red           (P0.08)
+ *   led3  = RGB blue          (P0.12)
+ *   sw0   = SW1 button        (P1.06) — already wired to INPUT_KEY_0 by board DTS
+ */
+
+/ {
+	hid_dev_0: hid_dev_0 {
+		compatible = "zephyr,hid-device";
+		interface-name = "HID0";
+		protocol-code = "keyboard";
+		in-report-size = <64>;
+		in-polling-period-us = <1000>;
+	};
+};

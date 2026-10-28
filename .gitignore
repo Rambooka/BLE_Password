@@ -1,0 +1,8 @@
+# west / sysbuild output
+build/
+build_*/
+
+# local archives and editor/tool state
+*.7z
+.claude/
+.vscode/

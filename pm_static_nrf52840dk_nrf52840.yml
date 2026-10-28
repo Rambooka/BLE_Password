@@ -1,0 +1,56 @@
+# 3rd-party Raytac MDBT50Q-RX (built as nrf52840dk/nrf52840): MCUboot at 0x0,
+# no Nordic bootloader.  Same slot/config layout as the official dongle so
+# config_storage sits at 0xDC000 on both boards, outside MCUboot's slots.
+#
+#   0x00000 MCUboot
+#   0x10000 slot 0 (running app)
+#   0x76000 slot 1 (BLE/SMP upload target)
+#   0xDC000 config_storage (raw persisted config)
+#   0xE0000 unused
+mcuboot:
+  address: 0x0
+  end_address: 0x10000
+  region: flash_primary
+  size: 0x10000
+mcuboot_pad:
+  address: 0x10000
+  end_address: 0x10200
+  region: flash_primary
+  size: 0x200
+app:
+  address: 0x10200
+  end_address: 0x76000
+  region: flash_primary
+  size: 0x65e00
+mcuboot_primary:
+  address: 0x10000
+  end_address: 0x76000
+  orig_span: &id001
+  - mcuboot_pad
+  - app
+  region: flash_primary
+  size: 0x66000
+  span: *id001
+mcuboot_primary_app:
+  address: 0x10200
+  end_address: 0x76000
+  orig_span: &id002
+  - app
+  region: flash_primary
+  size: 0x65e00
+  span: *id002
+mcuboot_secondary:
+  address: 0x76000
+  end_address: 0xdc000
+  region: flash_primary
+  size: 0x66000
+config_storage:
+  address: 0xdc000
+  end_address: 0xe0000
+  region: flash_primary
+  size: 0x4000
+unused_flash:
+  address: 0xe0000
+  end_address: 0x100000
+  region: flash_primary
+  size: 0x20000

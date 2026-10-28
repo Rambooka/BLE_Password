@@ -1,0 +1,65 @@
+/*
+ * Overlay for the 3rd-party Raytac MDBT50Q-RX USB dongle, built on the
+ * nrf52840dk board target (which boots from 0x0 → flashed standalone via J-Link).
+ *
+ * Board hardware:
+ *   - single blue LED on P1.13 (active low)   (D2/P1.11 is not populated)
+ *   - button on P0.15 (active low, pull-up)
+ *   - USB on the nRF52840 USB peripheral
+ */
+#include <zephyr/dt-bindings/gpio/gpio.h>
+#include <zephyr/dt-bindings/input/input-event-codes.h>
+
+/ {
+	mdbt_leds {
+		compatible = "gpio-leds";
+		ind_led: ind_led {
+			gpios = <&gpio1 13 GPIO_ACTIVE_LOW>;
+			label = "Blue indicator LED";
+		};
+	};
+
+	mdbt_keys {
+		compatible = "gpio-keys";
+		cfg_btn: cfg_btn {
+			gpios = <&gpio0 15 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			label = "SW1";
+			zephyr,code = <INPUT_KEY_0>;
+		};
+	};
+
+	aliases {
+		led0 = &ind_led;
+		sw0 = &cfg_btn;
+	};
+
+	/* USB HID keyboard (same as the app.overlay used for the dongle build). */
+	hid_dev_0: hid_dev_0 {
+		compatible = "zephyr,hid-device";
+		interface-name = "HID0";
+		protocol-code = "keyboard";
+		in-report-size = <64>;
+		in-polling-period-us = <1000>;
+	};
+};
+
+/* Make sure the USB device controller is available for HID. */
+&zephyr_udc0 {
+	status = "okay";
+};
+
+/* Disable the DK's on-board buttons so their pins (P0.11 etc.) don't emit
+ * INPUT_KEY_0 and interfere with our button on P0.15. */
+&button0 { status = "disabled"; };
+&button1 { status = "disabled"; };
+&button2 { status = "disabled"; };
+&button3 { status = "disabled"; };
+
+/* On the MDBT50Q-RX, module pins P0.18 (nRESET) and P0.19 are tied together.
+ * The DK's QSPI flash (not fitted here) has SCK on P0.19: the QSPI driver
+ * pulled the reset pin low and reset-looped the chip before main(), so SWD
+ * couldn't even power up the DAP ("bricked" two units). Drop the QSPI flash,
+ * and don't make P0.18 a reset pin (the DK writes UICR.PSELRESET at boot). */
+&qspi { status = "disabled"; };
+&mx25r64 { status = "disabled"; };
+&uicr { /delete-property/ gpio-as-nreset; };

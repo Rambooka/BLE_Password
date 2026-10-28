@@ -1,0 +1,62 @@
+# Official nRF52840 Dongle (PCA10059): MCUboot chained after the factory
+# Nordic Open USB bootloader.  Mirrors Zephyr's fstab-stock.dtsi layout.
+#
+#   0x00000 MBR (Nordic, untouched)
+#   0x01000 MCUboot            <- the only thing the Nordic bootloader flashes
+#                                 and CRC-checks (one-time migration package)
+#   0x10000 slot 0 (running app)
+#   0x76000 slot 1 (BLE/SMP upload target)
+#   0xDC000 config_storage     <- raw persisted config (unchanged location)
+#   0xE0000 Nordic bootloader + settings (reserved, never written)
+nrf5_mbr:
+  address: 0x0
+  end_address: 0x1000
+  region: flash_primary
+  size: 0x1000
+mcuboot:
+  address: 0x1000
+  end_address: 0x10000
+  region: flash_primary
+  size: 0xf000
+mcuboot_pad:
+  address: 0x10000
+  end_address: 0x10200
+  region: flash_primary
+  size: 0x200
+app:
+  address: 0x10200
+  end_address: 0x76000
+  region: flash_primary
+  size: 0x65e00
+mcuboot_primary:
+  address: 0x10000
+  end_address: 0x76000
+  orig_span: &id001
+  - mcuboot_pad
+  - app
+  region: flash_primary
+  size: 0x66000
+  span: *id001
+mcuboot_primary_app:
+  address: 0x10200
+  end_address: 0x76000
+  orig_span: &id002
+  - app
+  region: flash_primary
+  size: 0x65e00
+  span: *id002
+mcuboot_secondary:
+  address: 0x76000
+  end_address: 0xdc000
+  region: flash_primary
+  size: 0x66000
+config_storage:
+  address: 0xdc000
+  end_address: 0xe0000
+  region: flash_primary
+  size: 0x4000
+nrf5_bootloader:
+  address: 0xe0000
+  end_address: 0x100000
+  region: flash_primary
+  size: 0x20000
