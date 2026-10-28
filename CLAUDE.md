@@ -8,7 +8,7 @@ leaves, it locks the PC (Win+L). A companion Android app broadcasts the beacon,
 configures the dongle over BLE, and **carries the dongle firmware** for BLE updates.
 
 ## Repos / paths
-- Firmware: `c:\Users\rabram\Source\nRFConnect\BLE_Password` (this folder). App code in `src/main.c`.
+- Firmware: `c:\Users\rabram\Source\nRFConnect\BLE_Password` (this folder). App code in `src/main.c`. Git repo → **https://github.com/Rambooka/BLE_Password (PUBLIC)**. Never commit real passwords, keys, or build output (`.gitignore`: `build*/`, `*.7z`, `.claude/`). Local git's stored GitHub credential is for the **RambookaICT** account.
 - LED/button bring-up test (3rd-party board): `c:\Users\rabram\Source\nRFConnect\led_test`.
 - Android app: `C:\Users\rabram\Source\Android\BLE_Beacon` (Kotlin/Compose). Advertises the beacon, GATT config client, SMP firmware updater.
 - Datasheets / 3rd-party board info: `C:\_Datasheets\BLE Modules\RayTac\` (see `Rays Notes.txt`).
@@ -104,7 +104,9 @@ Then confirm it booted over RTT before unplugging (`JLinkRTTLogger -Device NRF52
 Compose UI: Password (short press), Username 2 + Password 2 (1-second press, optional) (passwords have eye show/hide), Beacon name, Green/Blue dBm, "Save & Send to Dongle", **"Update dongle firmware"** (dialog: pick Official dongle / MDBT50Q, shows the bundled version; progress bar), Start/Stop beacon. `BeaconService` advertises the beacon. `ConfigClient` scans/connects and either writes the 6 config characteristics (`send`; password 2 / username 2 skipped on old firmware when blank) or reads the board + arms DFU (`armDfu`). `FirmwareUpdater` = Nordic `mcumgr-ble` 3.4.1 `FirmwareUpgradeManager` in `TEST_ONLY` mode. `Firmware.kt` loads `assets/firmware/{nrf52840dongle,mdbt50q}.zip` and checks the manifest board. **The dongle's button must be held while saving / starting an update** (gate).
 - Firmware bundling: `bundleFirmware` task in `app/build.gradle.kts` copies `../../nRFConnect/BLE_Password/build_{nRF52840,mdbt50q}/dfu_application.zip` into generated assets (override with `-PfirmwareDir=...`). Missing zip → warning, that PCB shows "not bundled".
 - mcumgr 3.x requires **compileSdk 37** and **Kotlin 2.4.10** (both set; targetSdk still 36).
-- Build: `gradlew.bat :app:assembleDebug` (JAVA_HOME = Android Studio JBR); install `adb install -r app\build\outputs\apk\debug\app-debug.apk`.
+- **Credentials are never stored on the phone** (2026-10-28): the password fields start blank and are cleared after a successful send. Blank = "keep the dongle's current value" (not written). The "Remove Username 2 + Password 2" checkbox sends empty writes to clear login 2. Only the beacon name and thresholds are saved (SharedPreferences). `Config.purgeSecrets()` deletes plaintext credentials that older app versions saved. Password fields use `KeyboardType.Password` (no IME learning).
+- **No backup:** `allowBackup="false"`, and `data_extraction_rules.xml` / `backup_rules.xml` exclude everything (allowBackup=false alone doesn't stop Android 12+ device-to-device transfer).
+- Build: **release**, `gradlew.bat :app:assembleRelease` (JAVA_HOME = Android Studio JBR); install `adb install -r app\build\outputs\apk\release\app-release.apk`. A release build is not debuggable, so `adb shell run-as` can't read the app's data. That route was verified readable on the old debug build, without root. Signing key: `%USERPROFILE%\.android\ble_beacon_release.jks` plus `ble_beacon_keystore.properties` (passwords). Both are **outside the repo — back them up**. A lost key means uninstall + reinstall, and the beacon/threshold settings must be re-entered. Override the location with `-PreleaseKeystoreProps=...`. Debug builds (`assembleDebug`) are signed with a different key, so switching between debug and release requires `adb uninstall com.example.ble_beacon` first.
 
 ## Status / TODO
 - [x] MCUboot + BLE SMP update on both boards; app bundles both images.
