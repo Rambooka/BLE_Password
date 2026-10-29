@@ -4,8 +4,10 @@ import java.math.BigInteger
 import java.security.KeyFactory
 import java.security.KeyPair
 import java.security.KeyPairGenerator
+import java.security.PrivateKey
 import java.security.interfaces.ECPublicKey
 import java.security.spec.ECGenParameterSpec
+import java.security.spec.ECParameterSpec
 import java.security.spec.ECPoint
 import java.security.spec.ECPublicKeySpec
 import javax.crypto.KeyAgreement
@@ -15,12 +17,13 @@ import javax.crypto.spec.SecretKeySpec
 /**
  * Encrypted config session with the dongle — must match src/cfg_crypto.h.
  *
- * Per connection: P-256 ECDH (fresh phone key pair, the dongle's key from the
- * Session characteristic) → HKDF-SHA256 → k_enc / k_mac. Secret writes are
- * sealed as  seq[4 LE] || ct || tag[16]  with an HMAC keystream and an HMAC
- * tag, bound to the characteristic's short ID. Stops passive sniffing of the
- * passwords and the beacon key; it's unauthenticated ECDH, so not an active
- * man-in-the-middle during the config window.
+ * Per connection: the phone makes a fresh P-256 key pair and runs TWO ECDHs
+ * against the dongle — one with the dongle's EPHEMERAL key (forward secrecy) and
+ * one with its persistent IDENTITY key (authenticates the dongle) — then
+ * HKDF-SHA256 → k_enc / k_mac. Secret writes are sealed as
+ * seq[4 LE] || ct || tag[16] with an HMAC keystream and an HMAC tag, bound to
+ * the characteristic's short ID. Because the app pins the dongle's identity key,
+ * a relay/fake dongle that lacks its private key can't derive the session.
  *
  * Plain JCA, so it runs in a JVM unit test.
  */
@@ -36,7 +39,7 @@ class ConfigSession private constructor(
 
     companion object {
         const val PUB_LEN = 65
-        private val SALT = "BLEPW-SESSION-v1".toByteArray(Charsets.US_ASCII)
+        private val SALT = "BLEPW-SESSION-v2".toByteArray(Charsets.US_ASCII)
         private const val TAG_LEN = 16
 
         // Short IDs (low byte of each characteristic's UUID; see firmware).
@@ -45,39 +48,54 @@ class ConfigSession private constructor(
         const val ID_USERNAME2 = 0x09
         const val ID_BEACON_KEY = 0x0A
 
-        /** Run ECDH against the dongle's public key and derive the session. */
-        fun start(donglePublicKey: ByteArray): ConfigSession {
-            require(donglePublicKey.size == PUB_LEN && donglePublicKey[0] == 0x04.toByte()) {
+        /**
+         * Make the phone's ephemeral key pair, run ECDH against both the dongle's
+         * ephemeral key and its (pinned) identity key, and derive the session.
+         */
+        fun start(dongleEphemeralKey: ByteArray, dongleIdentityKey: ByteArray): ConfigSession {
+            require(dongleEphemeralKey.size == PUB_LEN && dongleEphemeralKey[0] == 0x04.toByte()) {
                 "bad dongle public key"
+            }
+            require(dongleIdentityKey.size == PUB_LEN && dongleIdentityKey[0] == 0x04.toByte()) {
+                "bad dongle identity key"
             }
             val kpg = KeyPairGenerator.getInstance("EC")
             kpg.initialize(ECGenParameterSpec("secp256r1"))
             val pair: KeyPair = kpg.generateKeyPair()
             val phonePub = encodePoint(pair.public as ECPublicKey)
-
             val params = (pair.public as ECPublicKey).params
+
+            val z1 = ecdh(pair.private, dongleEphemeralKey, params)  // forward secrecy
+            val z2 = ecdh(pair.private, dongleIdentityKey, params)   // authenticates dongle
+            val (kEnc, kMac) = derive(z1, z2, dongleIdentityKey, dongleEphemeralKey, phonePub)
+            z1.fill(0)
+            z2.fill(0)
+            return ConfigSession(phonePub, kEnc, kMac)
+        }
+
+        private fun ecdh(priv: PrivateKey, peerPub: ByteArray, params: ECParameterSpec): ByteArray {
             val peer = KeyFactory.getInstance("EC").generatePublic(
                 ECPublicKeySpec(
                     ECPoint(
-                        BigInteger(1, donglePublicKey.copyOfRange(1, 33)),
-                        BigInteger(1, donglePublicKey.copyOfRange(33, 65)),
+                        BigInteger(1, peerPub.copyOfRange(1, 33)),
+                        BigInteger(1, peerPub.copyOfRange(33, 65)),
                     ),
                     params,
                 )
             )
             val ka = KeyAgreement.getInstance("ECDH")
-            ka.init(pair.private)
+            ka.init(priv)
             ka.doPhase(peer, true)
-            val z = ka.generateSecret()   // 32-byte x-coordinate
-            val (kEnc, kMac) = derive(z, donglePublicKey, phonePub)
-            z.fill(0)
-            return ConfigSession(phonePub, kEnc, kMac)
+            return ka.generateSecret()   // 32-byte x-coordinate
         }
 
-        /** HKDF-SHA256(salt, Z, info = dongle_pub || phone_pub), L = 64. */
-        fun derive(z: ByteArray, donglePub: ByteArray, phonePub: ByteArray): Pair<ByteArray, ByteArray> {
-            val prk = hmac(SALT, z)
-            val info = donglePub + phonePub
+        /** HKDF-SHA256(salt v2, IKM = z1||z2, info = id_pub||dongle_pub||phone_pub), L = 64. */
+        fun derive(
+            z1: ByteArray, z2: ByteArray,
+            idPub: ByteArray, donglePub: ByteArray, phonePub: ByteArray,
+        ): Pair<ByteArray, ByteArray> {
+            val prk = hmac(SALT, z1 + z2)
+            val info = idPub + donglePub + phonePub
             val t1 = hmac(prk, info + byteArrayOf(1))
             val t2 = hmac(prk, t1 + info + byteArrayOf(2))
             return t1 to t2

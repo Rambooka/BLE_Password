@@ -15,7 +15,7 @@ android {
 
     defaultConfig {
         applicationId = "com.example.ble_beacon"
-        minSdk = 26   // Android 8+: AdvertisingSet (rolling beacon updates in place)
+        minSdk = 30   // Android 11+ (single modern code path; drops pre-11 branches)
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"

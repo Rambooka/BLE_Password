@@ -113,6 +113,11 @@ class MainActivity : FragmentActivity() {
                 var sending by remember { mutableStateOf(false) }
                 // Whether a credential set is saved on this phone (biometric-sealed).
                 var hasSavedCreds by remember { mutableStateOf(CredentialStore.hasCredentials(context)) }
+                // Pause the beacon when the phone is still (anti-relay); persisted toggle.
+                var motionGate by remember { mutableStateOf(Config.isMotionGateEnabled(context)) }
+                // Set when a dongle presents an identity we haven't paired with: the
+                // fingerprint to show + the callback that resumes or aborts the connection.
+                var unknownDongle by remember { mutableStateOf<Pair<String, (Boolean) -> Unit>?>(null) }
 
                 val launcher = rememberLauncherForActivityResult(
                     ActivityResultContracts.RequestMultiplePermissions()
@@ -151,7 +156,10 @@ class MainActivity : FragmentActivity() {
                     BeaconService.start(context)
                     sending = true
                     status = "Sending…"
-                    ConfigClient(context) { s, done, success ->
+                    ConfigClient(
+                        context,
+                        onUnknownIdentity = { fp, decide -> unknownDongle = fp to decide },
+                    ) { s, done, success ->
                         status = s
                         if (done) {
                             sending = false
@@ -317,6 +325,36 @@ class MainActivity : FragmentActivity() {
                         },
                         dismissButton = {
                             TextButton(onClick = { showFirmwarePicker = false }) { Text("Cancel") }
+                        },
+                    )
+                }
+
+                unknownDongle?.let { (fp, decide) ->
+                    AlertDialog(
+                        onDismissRequest = {
+                            decide(false)
+                            unknownDongle = null
+                        },
+                        title = { Text("New dongle?") },
+                        text = {
+                            Text(
+                                "This dongle (identity $fp…) isn't one you've paired with on " +
+                                    "this phone. If it's yours and you're holding its button, " +
+                                    "pair it. If you weren't expecting this, cancel — it could " +
+                                    "be an impostor trying to receive your password."
+                            )
+                        },
+                        confirmButton = {
+                            TextButton(onClick = {
+                                decide(true)
+                                unknownDongle = null
+                            }) { Text("Pair this dongle") }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = {
+                                decide(false)
+                                unknownDongle = null
+                            }) { Text("Cancel") }
                         },
                     )
                 }
@@ -542,6 +580,39 @@ class MainActivity : FragmentActivity() {
                         )
 
                         Spacer(Modifier.height(28.dp))
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    val on = !motionGate
+                                    motionGate = on
+                                    Config.setMotionGateEnabled(context, on)
+                                    // Re-apply immediately if the beacon is running.
+                                    if (Config.isBeaconEnabled(context)) BeaconService.start(context)
+                                }
+                        ) {
+                            Checkbox(
+                                checked = motionGate,
+                                onCheckedChange = { on ->
+                                    motionGate = on
+                                    Config.setMotionGateEnabled(context, on)
+                                    if (Config.isBeaconEnabled(context)) BeaconService.start(context)
+                                },
+                            )
+                            Text("Pause beacon when the phone is still for 5 min (anti-relay)")
+                        }
+                        Text(
+                            text = "Off by default. When on, a phone that sits motionless (e.g. " +
+                                "left behind) stops beaconing, so it can't be relayed — but a " +
+                                "phone resting still by the PC will also pause and lock it until moved.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 4.dp, bottom = 12.dp)
+                        )
 
                         ThreeDButton(
                             text = "START BEACON",

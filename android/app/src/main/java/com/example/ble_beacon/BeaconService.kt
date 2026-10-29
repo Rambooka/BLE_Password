@@ -15,6 +15,10 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.hardware.Sensor
+import android.hardware.SensorManager
+import android.hardware.TriggerEvent
+import android.hardware.TriggerEventListener
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -48,6 +52,13 @@ class BeaconService : Service() {
     private var ctr = 0L
     private var ticksSinceSave = 0
 
+    // ---- motion gate (optional, anti-relay) ----
+    private var sensorManager: SensorManager? = null
+    private var motionSensor: Sensor? = null
+    private var motionGateOn = false
+    private var motionPaused = false            // advertising stopped because still
+    private var lastMotionMs = 0L               // elapsedRealtime of the last motion/activity
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         key = BeaconKey.get(this)
         createNotificationChannel()
@@ -57,11 +68,7 @@ class BeaconService : Service() {
             .setSmallIcon(R.mipmap.ic_launcher)
             .build()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
-        } else {
-            startForeground(1, notification)
-        }
+        startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
 
         if (!running) {
             running = true
@@ -79,10 +86,70 @@ class BeaconService : Service() {
                 ContextCompat.RECEIVER_NOT_EXPORTED,
             )
             scheduleAlarm()
-        } else if (advertisingSet == null) {
+        } else if (advertisingSet == null && !motionPaused) {
             startAdvertising()   // e.g. Bluetooth was off when we first started
         }
+        // Re-read the motion-gate toggle on every start (so the UI switch applies live).
+        applyMotionConfig()
         return START_STICKY
+    }
+
+    // ---- motion gate ----
+    // When enabled, the beacon pauses after the phone has been still for
+    // STILL_TIMEOUT_MS, like a car key fob that ignores a relay while it sleeps on
+    // a hall table. A hardware one-shot "significant motion" trigger (low power)
+    // wakes it; screen-on / unlock also count as activity. Off by default.
+
+    private val motionTrigger = object : TriggerEventListener() {
+        override fun onTrigger(event: TriggerEvent?) {
+            noteActivity()
+            // One-shot: re-arm for the next motion.
+            motionSensor?.let { sensorManager?.requestTriggerSensor(this, it) }
+        }
+    }
+
+    /** Record motion/activity now, resuming the beacon if it had paused. */
+    private fun noteActivity() {
+        lastMotionMs = SystemClock.elapsedRealtime()
+        if (motionPaused) {
+            motionPaused = false
+            startAdvertising()
+            Log.i(TAG, "Motion — beacon resumed")
+        }
+    }
+
+    private fun applyMotionConfig() {
+        val on = Config.isMotionGateEnabled(this)
+        motionGateOn = on
+        if (on) {
+            if (sensorManager == null) sensorManager = getSystemService(SensorManager::class.java)
+            if (motionSensor == null) {
+                motionSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_SIGNIFICANT_MOTION)
+            }
+            lastMotionMs = SystemClock.elapsedRealtime()   // enabling counts as fresh motion
+            val s = motionSensor
+            if (s != null) {
+                sensorManager?.requestTriggerSensor(motionTrigger, s)
+            } else {
+                Log.w(TAG, "No significant-motion sensor; motion gate inactive")
+            }
+        } else {
+            motionSensor?.let { sensorManager?.cancelTriggerSensor(motionTrigger, it) }
+            if (motionPaused) {
+                motionPaused = false
+                startAdvertising()
+            }
+        }
+    }
+
+    /** Pause the beacon if motion-gating is on and the phone has been still too long. */
+    private fun maybePauseForStillness() {
+        if (!motionGateOn || motionSensor == null || motionPaused) return
+        if (SystemClock.elapsedRealtime() - lastMotionMs >= STILL_TIMEOUT_MS) {
+            motionPaused = true
+            stopAdvertising()
+            Log.i(TAG, "Phone still — beacon paused (anti-relay)")
+        }
     }
 
     // ---- counter ----
@@ -98,7 +165,8 @@ class BeaconService : Service() {
     private fun tick() {
         if (!running) return
         ctr = maxOf(ctr + 1, nowSec()) and 0xFFFF_FFFFL
-        updateAdvertisingData()
+        if (!motionPaused) updateAdvertisingData()
+        maybePauseForStillness()
         if (++ticksSinceSave >= SAVE_EVERY_TICKS) {
             ticksSinceSave = 0
             prefs().edit { putLong(KEY_CTR, ctr) }
@@ -123,6 +191,11 @@ class BeaconService : Service() {
                     BluetoothAdapter.STATE_OFF -> advertisingSet = null
                 }
                 return
+            }
+            // Using the phone (screen on / unlock) counts as activity for the gate.
+            if (intent.action == Intent.ACTION_SCREEN_ON ||
+                intent.action == Intent.ACTION_USER_PRESENT) {
+                noteActivity()
             }
             tick()
             if (intent.action == ACTION_TICK) scheduleAlarm()
@@ -185,6 +258,15 @@ class BeaconService : Service() {
         }
     }
 
+    private fun stopAdvertising() {
+        try {
+            advertiser?.stopAdvertisingSet(setCallback)
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Permission denied to stop advertising", e)
+        }
+        advertisingSet = null
+    }
+
     private val setCallback = object : AdvertisingSetCallback() {
         override fun onAdvertisingSetStarted(set: AdvertisingSet?, txPower: Int, status: Int) {
             if (status == ADVERTISE_SUCCESS) {
@@ -204,6 +286,7 @@ class BeaconService : Service() {
         super.onDestroy()
         running = false
         main.removeCallbacks(tickLoop)
+        motionSensor?.let { sensorManager?.cancelTriggerSensor(motionTrigger, it) }
         runCatching { unregisterReceiver(wakeReceiver) }
         getSystemService(AlarmManager::class.java)?.cancel(alarmIntent())
         prefs().edit { putLong(KEY_CTR, ctr) }
@@ -242,5 +325,6 @@ class BeaconService : Service() {
         private const val SAVE_EVERY_TICKS = 60
         private const val ALARM_INTERVAL_MS = 60_000L
         private const val ACTION_TICK = "com.example.ble_beacon.BEACON_TICK"
+        private const val STILL_TIMEOUT_MS = 5 * 60_000L   // pause the beacon after 5 min still
     }
 }

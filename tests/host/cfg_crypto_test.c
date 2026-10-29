@@ -36,23 +36,27 @@ static void check(const char *what, int cond)
 
 int main(void)
 {
-	uint8_t z[32], dp[65], pp[65], k_enc[32], k_mac[32], want[128], buf[128], pt[128];
+	uint8_t z1[32], z2[32], ip[65], dp[65], pp[65];
+	uint8_t k_enc[32], k_mac[32], want[128], buf[128], pt[128];
 
-	memset(z, 0x11, sizeof(z));
+	memset(z1, 0x11, sizeof(z1));
+	memset(z2, 0x44, sizeof(z2));
+	ip[0] = 0x04;
+	memset(ip + 1, 0x55, 64);
 	dp[0] = 0x04;
 	memset(dp + 1, 0x22, 64);
 	pp[0] = 0x04;
 	memset(pp + 1, 0x33, 64);
 
-	cfg_session_derive(z, dp, pp, k_enc, k_mac);
-	hex("f1ff356b00d96635697c5d651a968295ec6701cd24cf6d8c9b9d1097b326f70c", want);
+	cfg_session_derive(z1, z2, ip, dp, pp, k_enc, k_mac);
+	hex("6ab9ce9cbad04d216affe112127e29e38173f1c067a7cdd9e260606555655280", want);
 	check("hkdf k_enc", memcmp(k_enc, want, 32) == 0);
-	hex("706e5fd2260f0bd13613acd40411c82c65dc7dec26a3ecdbaa5bffb9b5407df7", want);
+	hex("ab7586a4b7d4ec34eb8c2adf87edbd36c4c66602f07ad9425de96e444f06ce4e", want);
 	check("hkdf k_mac", memcmp(k_mac, want, 32) == 0);
 
 	/* seal matches the Python vector */
 	size_t n = cfg_seal(k_enc, k_mac, 0x02, 1, (const uint8_t *)"Secret-pw1", 10, buf);
-	size_t wn = hex("0100000021762fa163c2ab8f77e7e7f07a1c892c14a9396541cbf9121546", want);
+	size_t wn = hex("010000003f9611d1dcf0b6cf524e0a527e78047c8f0d4dfdb3d2f1c84f19", want);
 
 	check("seal vector", n == wn && memcmp(buf, want, n) == 0);
 
@@ -85,8 +89,8 @@ int main(void)
 		pt40[i] = (uint8_t)i;
 	}
 	n = cfg_seal(k_enc, k_mac, 0x0a, 7, pt40, sizeof(pt40), buf);
-	wn = hex("07000000cd80d3ec0c280ca8748d939261bfa9b4835c4cc98a4c88053026b10ccf515daf"
-		 "33f2ecd4b129465c0e3963c499b3b7627569f0dd49b310c4", want);
+	wn = hex("07000000e3713fe194218679393ce494e9150f088a4b3da0298fbdcf69eb714e6b1ffe02"
+		 "7ea53c3e90a9911e1512dea12d6bd6028ec9378d8083a8d7", want);
 	check("seal 2-block vector", n == wn && memcmp(buf, want, n) == 0);
 	last = 6;
 	r = cfg_open(k_enc, k_mac, 0x0a, &last, buf, n, pt, sizeof(pt));

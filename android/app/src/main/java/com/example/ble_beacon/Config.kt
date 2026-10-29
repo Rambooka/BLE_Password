@@ -40,6 +40,9 @@ object Config {
     // Read: the dongle's ECDH public key; write: ours (see ConfigSession). The
     // passwords and the beacon key are only accepted sealed with that session.
     val SESSION_UUID: UUID = UUID.fromString("9f1b000c-5c3a-4e8e-9c2a-1a2b3c4d5e6f")
+    // Read: the dongle's persistent identity public key (fw 1.4.0+). The app pins
+    // it at first pairing and verifies it every session (authenticates the dongle).
+    val IDENTITY_UUID: UUID = UUID.fromString("9f1b000d-5c3a-4e8e-9c2a-1a2b3c4d5e6f")
 
     // The dongle's advertised name (CONFIG_BT_DEVICE_NAME in firmware).
     const val DONGLE_NAME = "BLE_Password"
@@ -53,9 +56,35 @@ object Config {
     private const val KEY_GREEN = "green_threshold"
     private const val KEY_BLUE = "blue_threshold"
     private const val KEY_BEACON_ON = "beacon_enabled"
+    private const val KEY_MOTION_GATE = "motion_gate_enabled"
+    // Trusted dongle identity public keys (hex), pinned at first pairing so the
+    // app can recognise its own dongle(s) and refuse an impostor (fw 1.4.0+).
+    private const val KEY_TRUSTED_IDS = "trusted_dongle_ids"
 
     private fun prefs(ctx: Context) =
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    /**
+     * Pause the beacon when the phone hasn't moved for a while (anti-relay, like
+     * a car key fob). A persisted toggle so it can be changed without a new build.
+     * Default OFF: a phone sitting still next to the PC would otherwise lock it.
+     */
+    fun isMotionGateEnabled(ctx: Context): Boolean =
+        prefs(ctx).getBoolean(KEY_MOTION_GATE, false)
+
+    fun setMotionGateEnabled(ctx: Context, on: Boolean) {
+        prefs(ctx).edit { putBoolean(KEY_MOTION_GATE, on) }
+    }
+
+    /** Is this dongle identity (hex public key) one we've paired with before? */
+    fun isTrustedIdentity(ctx: Context, idHex: String): Boolean =
+        prefs(ctx).getStringSet(KEY_TRUSTED_IDS, emptySet())?.contains(idHex) == true
+
+    /** Pin a dongle identity as trusted (trust-on-first-use, button held). */
+    fun addTrustedIdentity(ctx: Context, idHex: String) {
+        val cur = prefs(ctx).getStringSet(KEY_TRUSTED_IDS, emptySet()) ?: emptySet()
+        prefs(ctx).edit { putStringSet(KEY_TRUSTED_IDS, cur + idHex) }
+    }
 
     // When nothing has been saved yet, the getters return EMPTY strings so the
     // UI fields start blank (the user fills them in), rather than pre-filling the

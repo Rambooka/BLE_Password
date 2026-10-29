@@ -11,37 +11,52 @@
 /* Largest sealed plaintext we handle (a 64-char password + NUL headroom). */
 #define CFG_MAX_PT 80
 
-void cfg_session_derive(const uint8_t z[CFG_SECRET_LEN],
+/* Append the HKDF info (id_pub || dongle_pub || phone_pub) at buf+off. */
+static size_t cfg_info(uint8_t *buf, size_t off, const uint8_t id_pub[CFG_PUB_LEN],
+		       const uint8_t dongle_pub[CFG_PUB_LEN],
+		       const uint8_t phone_pub[CFG_PUB_LEN])
+{
+	memcpy(buf + off, id_pub, CFG_PUB_LEN);
+	off += CFG_PUB_LEN;
+	memcpy(buf + off, dongle_pub, CFG_PUB_LEN);
+	off += CFG_PUB_LEN;
+	memcpy(buf + off, phone_pub, CFG_PUB_LEN);
+	off += CFG_PUB_LEN;
+	return off;
+}
+
+void cfg_session_derive(const uint8_t z1[CFG_SECRET_LEN],
+			const uint8_t z2[CFG_SECRET_LEN],
+			const uint8_t id_pub[CFG_PUB_LEN],
 			const uint8_t dongle_pub[CFG_PUB_LEN],
 			const uint8_t phone_pub[CFG_PUB_LEN],
 			uint8_t k_enc[CFG_SUBKEY_LEN],
 			uint8_t k_mac[CFG_SUBKEY_LEN])
 {
-	static const uint8_t salt[] = "BLEPW-SESSION-v1";
+	static const uint8_t salt[] = "BLEPW-SESSION-v2";
+	uint8_t ikm[2 * CFG_SECRET_LEN];
 	uint8_t prk[SHA256_DIGEST_LEN];
-	/* T(2) input is the longest: T(1) || info || 0x02 */
-	uint8_t buf[SHA256_DIGEST_LEN + 2 * CFG_PUB_LEN + 1];
+	/* T(2) input is the longest: T(1) || info || 0x02 (info = 3 public keys) */
+	uint8_t buf[SHA256_DIGEST_LEN + 3 * CFG_PUB_LEN + 1];
 	size_t n;
 
-	/* HKDF-Extract */
-	hmac_sha256(salt, sizeof(salt) - 1, z, CFG_SECRET_LEN, prk);
+	/* HKDF-Extract over both shared secrets. */
+	memcpy(ikm, z1, CFG_SECRET_LEN);
+	memcpy(ikm + CFG_SECRET_LEN, z2, CFG_SECRET_LEN);
+	hmac_sha256(salt, sizeof(salt) - 1, ikm, sizeof(ikm), prk);
 
 	/* HKDF-Expand: T(1) = HMAC(PRK, info || 01) */
-	memcpy(buf, dongle_pub, CFG_PUB_LEN);
-	memcpy(buf + CFG_PUB_LEN, phone_pub, CFG_PUB_LEN);
-	buf[2 * CFG_PUB_LEN] = 0x01;
-	hmac_sha256(prk, sizeof(prk), buf, 2 * CFG_PUB_LEN + 1, k_enc);
+	n = cfg_info(buf, 0, id_pub, dongle_pub, phone_pub);
+	buf[n++] = 0x01;
+	hmac_sha256(prk, sizeof(prk), buf, n, k_enc);
 
 	/* T(2) = HMAC(PRK, T(1) || info || 02) */
 	memcpy(buf, k_enc, SHA256_DIGEST_LEN);
-	n = SHA256_DIGEST_LEN;
-	memcpy(buf + n, dongle_pub, CFG_PUB_LEN);
-	n += CFG_PUB_LEN;
-	memcpy(buf + n, phone_pub, CFG_PUB_LEN);
-	n += CFG_PUB_LEN;
+	n = cfg_info(buf, SHA256_DIGEST_LEN, id_pub, dongle_pub, phone_pub);
 	buf[n++] = 0x02;
 	hmac_sha256(prk, sizeof(prk), buf, n, k_mac);
 
+	memset(ikm, 0, sizeof(ikm));
 	memset(prk, 0, sizeof(prk));
 	memset(buf, 0, sizeof(buf));
 }

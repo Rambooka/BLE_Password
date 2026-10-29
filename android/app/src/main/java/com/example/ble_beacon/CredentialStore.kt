@@ -1,7 +1,6 @@
 package com.example.ble_beacon
 
 import android.content.Context
-import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
@@ -217,17 +216,8 @@ object CredentialStore {
             .setKeySize(256)
             .setUserAuthenticationRequired(true)
             .setInvalidatedByBiometricEnrollment(true)
-            .apply {
-                // Per-operation auth: a fresh fingerprint for every use.
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    setUserAuthenticationParameters(
-                        0, KeyProperties.AUTH_BIOMETRIC_STRONG
-                    )
-                } else {
-                    @Suppress("DEPRECATION")
-                    setUserAuthenticationValidityDurationSeconds(-1)
-                }
-            }
+            // Per-operation auth: a fresh fingerprint for every use (minSdk 30).
+            .setUserAuthenticationParameters(0, KeyProperties.AUTH_BIOMETRIC_STRONG)
             .build()
         gen.init(spec)
         return gen.generateKey()

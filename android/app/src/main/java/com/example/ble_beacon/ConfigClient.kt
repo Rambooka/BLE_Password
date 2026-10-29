@@ -33,10 +33,19 @@ import java.util.UUID
 @SuppressLint("MissingPermission") // caller guarantees BLUETOOTH_SCAN/CONNECT granted
 class ConfigClient(
     private val context: Context,
+    // Called (main thread) when the dongle's identity isn't one we've paired with
+    // before: the UI confirms with the user, then calls decide(true) to pin + go on,
+    // or decide(false) to abort. Default rejects (used by the DFU path, which
+    // doesn't read the identity).
+    private val onUnknownIdentity: (fingerprint: String, decide: (Boolean) -> Unit) -> Unit =
+        { _, decide -> decide(false) },
     private val listener: (status: String, done: Boolean, success: Boolean) -> Unit,
 ) {
     private val tag = "ConfigClient"
     private val main = Handler(Looper.getMainLooper())
+
+    // The dongle's pinned identity public key for this connection (settings path).
+    private var dongleIdentity: ByteArray? = null
 
     private var scanner: BluetoothLeScanner? = null
     private var gatt: BluetoothGatt? = null
@@ -188,11 +197,11 @@ class ConfigClient(
             val held = BeaconCrypto.dongleButtonHeld(
                 result.scanRecord?.getManufacturerSpecificData(BeaconCrypto.COMPANY_ID)
             )
-            // Only ever connect to a dongle advertising "button held" (fw 1.2+).
+            // Only ever connect to a dongle advertising "button held".
             when (held) {
                 true -> connect(device)
                 false -> sawUnheldDongle = true
-                null -> {}   // no flag: pre-1.2 firmware, or not a dongle
+                null -> {}   // no held flag in the advert: not our dongle
             }
         }
 
@@ -258,14 +267,12 @@ class ConfigClient(
                 }
                 return
             }
-            // Settings: first check whether the dongle already has our key.
+            // Settings: first check whether the dongle already has our key. The
+            // app targets current firmware only; the session/identity reads below
+            // fail cleanly if a characteristic is somehow absent.
             val keyIdCh = service.getCharacteristic(Config.KEY_ID_UUID)
-            if (keyIdCh == null || service.getCharacteristic(Config.SESSION_UUID) == null) {
-                finish(
-                    "This dongle's firmware is older than 1.2 (no secure beacon). " +
-                        "Update the dongle firmware first.",
-                    false,
-                )
+            if (keyIdCh == null) {
+                finish("Dongle config service incomplete. Update the dongle firmware.", false)
                 return
             }
             report("Checking pairing…")
@@ -319,13 +326,13 @@ class ConfigClient(
         when (uuid) {
             Config.BOARD_UUID -> onBoardRead(value, status)
             Config.KEY_ID_UUID -> onKeyIdRead(value, status)
+            Config.IDENTITY_UUID -> onIdentityRead(value, status)
             Config.SESSION_UUID -> onSessionRead(value, status)
         }
     }
 
-    // Send our beacon key only if the dongle doesn't hold it already, so the
-    // key goes over the air once per dongle, not on every save. Then set up
-    // the encrypted session.
+    // Send our beacon key only if the dongle doesn't hold it already. Then read
+    // the dongle's identity to authenticate it before the encrypted session.
     private fun onKeyIdRead(value: ByteArray, status: Int) {
         if (status != BluetoothGatt.GATT_SUCCESS) {
             finish("Failed to read the dongle's pairing (status $status).", false)
@@ -337,6 +344,41 @@ class ConfigClient(
             writeQueue.addFirst(WriteItem(Config.BEACON_KEY_UUID, key, sealId = ConfigSession.ID_BEACON_KEY))
         }
         val g = gatt ?: return
+        val ch = g.getService(Config.SERVICE_UUID)?.getCharacteristic(Config.IDENTITY_UUID)
+        report("Checking dongle identity…")
+        if (ch == null || !g.readCharacteristic(ch)) {
+            finish("Failed to read the dongle identity.", false)
+        }
+    }
+
+    // The dongle's persistent identity: if we've paired with it before, proceed;
+    // otherwise ask the UI to confirm (trust-on-first-use) before pinning it.
+    private fun onIdentityRead(value: ByteArray, status: Int) {
+        if (status != BluetoothGatt.GATT_SUCCESS || value.size != ConfigSession.PUB_LEN) {
+            finish("Failed to read the dongle identity (status $status).", false)
+            return
+        }
+        val idHex = BeaconCrypto.hex(value)
+        if (Config.isTrustedIdentity(context, idHex)) {
+            dongleIdentity = value
+            proceedToSession()
+        } else {
+            main.post {
+                onUnknownIdentity(idHex.take(8)) { approved ->
+                    if (approved) {
+                        Config.addTrustedIdentity(context, idHex)
+                        dongleIdentity = value
+                        proceedToSession()
+                    } else {
+                        finish("Pairing cancelled — this dongle isn't paired to this phone.", false)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun proceedToSession() {
+        val g = gatt ?: return
         val ch = g.getService(Config.SERVICE_UUID)?.getCharacteristic(Config.SESSION_UUID)
         report("Securing the connection…")
         if (ch == null || !g.readCharacteristic(ch)) {
@@ -344,14 +386,18 @@ class ConfigClient(
         }
     }
 
-    // The dongle's ECDH public key: derive the session, send ours first, then
-    // the (sealed) settings.
+    // The dongle's ephemeral ECDH key: derive the session (bound to the pinned
+    // identity), send ours first, then the (sealed) settings.
     private fun onSessionRead(value: ByteArray, status: Int) {
         if (status != BluetoothGatt.GATT_SUCCESS) {
             finish("Failed to read the dongle's session key (status $status).", false)
             return
         }
-        val s = runCatching { ConfigSession.start(value) }.getOrElse {
+        val identity = dongleIdentity ?: run {
+            finish("Internal error: dongle identity missing.", false)
+            return
+        }
+        val s = runCatching { ConfigSession.start(value, identity) }.getOrElse {
             finish("The dongle sent an invalid session key. Replug it and try again.", false)
             return
         }
@@ -397,7 +443,6 @@ class ConfigClient(
         val service = g.getService(Config.SERVICE_UUID)
         val ch = service?.getCharacteristic(item.uuid)
         if (ch == null) {
-            // Settings need fw 1.2.0+ (checked up front), which has them all.
             finish("Characteristic ${item.uuid} missing.", false)
             return
         }

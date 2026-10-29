@@ -20,12 +20,18 @@
  *   passwords, beacon key and thresholds; they apply immediately.
  *
  *   SECRETS LIVE IN RAM ONLY (fw 1.3.0+).  The password(s), the second
- *   username and the rolling-beacon key are NEVER written to flash; only the
- *   RSSI thresholds persist (config_storage).  So a lost or stolen dongle,
- *   once unplugged, holds no secret at all.  The price is that the phone must
- *   re-send the secrets (button held) after every power-up / reboot / update:
- *   the boot config window therefore stays open until they have been received,
- *   instead of timing out into a useless blank "normal" mode.
+ *   username and the rolling-beacon key are NEVER written to flash.  So a lost
+ *   or stolen dongle, once unplugged, holds no credential — only a persistent
+ *   identity key (fw 1.4.0+, see below), whose leak lets someone impersonate
+ *   THIS dongle to the phone but never reveals a password.  The price is that
+ *   the phone must re-send the secrets (button held) after every power-up /
+ *   reboot / update: the boot config window therefore stays open until they
+ *   have been received, instead of timing out into a useless blank "normal" mode.
+ *
+ *   AUTHENTICATED CONFIG (fw 1.4.0+): the dongle has a persistent P-256 identity
+ *   key (the one thing in flash); the config session mixes an ECDH against it
+ *   and the app pins its public key, so a relay or fake dongle can't receive the
+ *   secrets (see cfg_crypto.h).
  *
  *   A write is only accepted while (a) the boot config window is open AND
  *   (b) the dongle's own button is physically held down at the instant the
@@ -54,6 +60,7 @@
 #include <zephyr/bluetooth/att.h>
 #include <zephyr/usb/usbd.h>
 #include <zephyr/usb/class/usbd_hid.h>
+#include <zephyr/drivers/flash.h>
 #include <zephyr/drivers/hwinfo.h>
 #include <zephyr/drivers/watchdog.h>
 #include <zephyr/sys/reboot.h>
@@ -62,6 +69,7 @@
 #include <zephyr/dfu/mcuboot.h>
 #include <zephyr/mgmt/mcumgr/mgmt/callbacks.h>
 #include <zephyr/mgmt/mcumgr/mgmt/mgmt_defines.h>
+#include <pm_config.h>
 #include <app_version.h>
 #include <string.h>
 #include <stdio.h>
@@ -160,6 +168,8 @@ static volatile bool key_received;
 	BT_UUID_128_ENCODE(0x9f1b000b, 0x5c3a, 0x4e8e, 0x9c2a, 0x1a2b3c4d5e6f)
 #define CFG_SESSION_UUID_VAL \
 	BT_UUID_128_ENCODE(0x9f1b000c, 0x5c3a, 0x4e8e, 0x9c2a, 0x1a2b3c4d5e6f)
+#define CFG_IDENT_UUID_VAL \
+	BT_UUID_128_ENCODE(0x9f1b000d, 0x5c3a, 0x4e8e, 0x9c2a, 0x1a2b3c4d5e6f)
 
 /* Short IDs bound into each sealed write (low byte of the UUID). */
 #define SEAL_ID_PASSWORD   0x02
@@ -178,6 +188,7 @@ static const struct bt_uuid_128 cfg_user2_uuid  = BT_UUID_INIT_128(CFG_USER2_UUI
 static const struct bt_uuid_128 cfg_key_uuid    = BT_UUID_INIT_128(CFG_KEY_UUID_VAL);
 static const struct bt_uuid_128 cfg_keyid_uuid  = BT_UUID_INIT_128(CFG_KEYID_UUID_VAL);
 static const struct bt_uuid_128 cfg_session_uuid = BT_UUID_INIT_128(CFG_SESSION_UUID_VAL);
+static const struct bt_uuid_128 cfg_ident_uuid  = BT_UUID_INIT_128(CFG_IDENT_UUID_VAL);
 
 /* ---- LEDs --------------------------------------------------------------- */
 /* Official nRF52840 Dongle has 3 LEDs (blue/green/red).  The 3rd-party Raytac
@@ -712,10 +723,115 @@ static bool thresholds_sane(void)
 	return true;
 }
 
+/* ---- Dongle identity key (persistent; authenticates the dongle) --------- */
+/* A long-term P-256 key pair, generated once on first boot and the ONLY thing
+ * kept in flash (1.4.0+), in the otherwise-unused config_storage partition.
+ * The session key mixes in an ECDH against it (cfg_crypto.h: z2), and the app
+ * pins its public key at first pairing and verifies it every session — so a
+ * relay or fake dongle, lacking the identity private key, can't derive the
+ * session.  A lost dongle leaks only this impersonation key (not any password);
+ * lock it with APPROTECT for defence in depth. */
+#define IDENT_MAGIC   0xB1E5A001u
+#define IDENT_OFFSET  PM_CONFIG_STORAGE_ADDRESS
+BUILD_ASSERT(PM_CONFIG_STORAGE_ADDRESS == 0xDC000,
+	     "config_storage moved — existing dongles would lose their identity key");
+
+struct ident_rec {
+	uint32_t magic;
+	uint8_t  priv[32];   /* P-256 private scalar */
+};
+BUILD_ASSERT(sizeof(struct ident_rec) % 4 == 0, "ident_rec must be 4-aligned");
+
+static const struct device *flash_dev =
+	DEVICE_DT_GET(DT_CHOSEN(zephyr_flash_controller));
+
+static psa_key_id_t ident_priv;
+static uint8_t ident_pub[CFG_PUB_LEN];
+static bool ident_ok;
+
+/* Load the identity key (generating + persisting it on first boot).  Call BEFORE
+ * bt_enable(): the one-time flash write must run with the radio off (un-synced
+ * flash).  On every later boot it only reads + imports, no write. */
+static void identity_load(void)
+{
+	struct ident_rec rec;
+	psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
+	size_t len = 0;
+
+	ident_ok = false;
+	if (psa_crypto_init() != PSA_SUCCESS) {
+		LOG_ERR("psa_crypto_init failed (identity)");
+		return;
+	}
+	if (!device_is_ready(flash_dev)) {
+		LOG_ERR("flash device not ready (identity)");
+		return;
+	}
+
+	psa_set_key_type(&attr, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
+	psa_set_key_bits(&attr, 256);
+	psa_set_key_algorithm(&attr, PSA_ALG_ECDH);
+
+	if (flash_read(flash_dev, IDENT_OFFSET, &rec, sizeof(rec)) == 0 &&
+	    rec.magic == IDENT_MAGIC) {
+		psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_DERIVE);
+		if (psa_import_key(&attr, rec.priv, sizeof(rec.priv), &ident_priv) != PSA_SUCCESS) {
+			LOG_ERR("identity import failed");
+			memset(&rec, 0, sizeof(rec));
+			return;
+		}
+	} else {
+		/* First boot: generate, export the private scalar, persist it. */
+		size_t plen = 0;
+
+		psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_DERIVE | PSA_KEY_USAGE_EXPORT);
+		if (psa_generate_key(&attr, &ident_priv) != PSA_SUCCESS) {
+			LOG_ERR("identity keygen failed");
+			return;
+		}
+		if (psa_export_key(ident_priv, rec.priv, sizeof(rec.priv), &plen) != PSA_SUCCESS ||
+		    plen != sizeof(rec.priv)) {
+			LOG_ERR("identity export failed");
+			(void)psa_destroy_key(ident_priv);
+			return;
+		}
+		rec.magic = IDENT_MAGIC;
+		/* Erase the WHOLE config_storage region, not just the identity's sector:
+		 * this also wipes any leftover pre-1.3 record (which held the password in
+		 * plaintext) and the old beacon counter log, so a dongle upgraded from
+		 * 1.2.x keeps nothing behind.  Radio is still off here. */
+		int rc = flash_erase(flash_dev, IDENT_OFFSET, PM_CONFIG_STORAGE_SIZE);
+
+		if (rc == 0) {
+			rc = flash_write(flash_dev, IDENT_OFFSET, &rec, sizeof(rec));
+		}
+		LOG_INF("Generated dongle identity, wiped config_storage (flash rc=%d)", rc);
+	}
+	memset(&rec, 0, sizeof(rec));
+
+	if (psa_export_public_key(ident_priv, ident_pub, sizeof(ident_pub), &len) != PSA_SUCCESS ||
+	    len != CFG_PUB_LEN) {
+		LOG_ERR("identity public export failed");
+		(void)psa_destroy_key(ident_priv);
+		return;
+	}
+	ident_ok = true;
+}
+
+/* The dongle's long-term identity public key.  No gate: it's public, and the app
+ * pins it to recognise this dongle on later connects. */
+static ssize_t read_identity(struct bt_conn *conn,
+			     const struct bt_gatt_attr *attr,
+			     void *buf, uint16_t len, uint16_t offset)
+{
+	return bt_gatt_attr_read(conn, attr, buf, len, offset,
+				 ident_pub, ident_ok ? sizeof(ident_pub) : 0);
+}
+
 /* ---- Encrypted config session (ECDH, see cfg_crypto.h) ----------------- */
-/* One dongle key pair per config window; a fresh session (phone key pair →
- * shared secret → k_enc/k_mac) per connection.  Secret writes are refused
- * until the session exists. */
+/* One dongle EPHEMERAL key pair per config window; a fresh session (phone key
+ * pair → two shared secrets → k_enc/k_mac) per connection.  Secret writes are
+ * refused until the session exists. */
 static psa_key_id_t sess_priv;
 static uint8_t sess_pub[CFG_PUB_LEN];
 static bool sess_pub_ok;
@@ -788,10 +904,11 @@ static ssize_t write_session(struct bt_conn *conn,
 	ARG_UNUSED(conn);
 	ARG_UNUSED(attr);
 	ARG_UNUSED(flags);
-	uint8_t z[CFG_SECRET_LEN];
+	uint8_t z1[CFG_SECRET_LEN];   /* ephemeral×phone */
+	uint8_t z2[CFG_SECRET_LEN];   /* identity×phone  */
 	size_t zlen = 0;
 
-	if (!config_mode || !sess_pub_ok) {
+	if (!config_mode || !sess_pub_ok || !ident_ok) {
 		return BT_GATT_ERR(BT_ATT_ERR_AUTHORIZATION);
 	}
 	if (offset != 0) {
@@ -801,15 +918,24 @@ static ssize_t write_session(struct bt_conn *conn,
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 	session_clear();
-	/* PSA validates that the point is on the curve. */
+	/* PSA validates that the point is on the curve.  z1 gives forward secrecy;
+	 * z2 (against the persistent identity key) authenticates the dongle. */
 	if (psa_raw_key_agreement(PSA_ALG_ECDH, sess_priv, buf, len,
-				  z, sizeof(z), &zlen) != PSA_SUCCESS ||
-	    zlen != sizeof(z)) {
+				  z1, sizeof(z1), &zlen) != PSA_SUCCESS ||
+	    zlen != sizeof(z1)) {
 		LOG_WRN("ECDH failed (bad phone key?)");
 		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 	}
-	cfg_session_derive(z, sess_pub, buf, sess_enc, sess_mac);
-	memset(z, 0, sizeof(z));
+	if (psa_raw_key_agreement(PSA_ALG_ECDH, ident_priv, buf, len,
+				  z2, sizeof(z2), &zlen) != PSA_SUCCESS ||
+	    zlen != sizeof(z2)) {
+		memset(z1, 0, sizeof(z1));
+		LOG_WRN("identity ECDH failed");
+		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+	}
+	cfg_session_derive(z1, z2, ident_pub, sess_pub, buf, sess_enc, sess_mac);
+	memset(z1, 0, sizeof(z1));
+	memset(z2, 0, sizeof(z2));
 	sess_ready = true;
 	LOG_INF("Config session established");
 	return len;
@@ -1160,6 +1286,10 @@ BT_GATT_SERVICE_DEFINE(cfg_svc,
 			       BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
 			       BT_GATT_PERM_READ | BT_GATT_PERM_WRITE,
 			       read_session, write_session, NULL),
+	BT_GATT_CHARACTERISTIC(&cfg_ident_uuid.uuid,
+			       BT_GATT_CHRC_READ,
+			       BT_GATT_PERM_READ,
+			       read_identity, NULL, NULL),
 );
 
 /* ---- Connectable advertising ------------------------------------------- */
@@ -1591,9 +1721,12 @@ static void ble_init_thread_fn(void *a, void *b, void *c)
 		k_work_submit(&lock_work);
 	}
 
-	/* Nothing is loaded from flash: the thresholds start at their compiled
+	/* No config is loaded from flash — thresholds start at their compiled
 	 * defaults and the secrets start blank; the phone re-sends everything during
-	 * this boot's config window (RAM-only config, see the file header). */
+	 * this boot's config window (RAM-only config).  The one thing persisted is
+	 * the dongle's identity key: load it (and generate+write it on first boot)
+	 * now, while the radio is still off. */
+	identity_load();
 
 	/* MCUboot: if this image was just installed as a test swap, mark it good
 	 * now that it has booted this far.  If it crashes before reaching here,
@@ -1796,6 +1929,16 @@ static void type_full_status(void)
 			 (unsigned long)beacon_ctr_last, (unsigned long)beacon_ctr_floor);
 	} else {
 		snprintf(line, sizeof(line), "beacon_key=(not set: pair from the app)\n");
+	}
+	type_string(line);
+	/* Identity fingerprint (first 4 bytes of the public key): persists across
+	 * reboots, so it should stay the same — the app pins it to recognise this
+	 * dongle.  "(none)" means the identity key failed to load. */
+	if (ident_ok) {
+		snprintf(line, sizeof(line), "ident=%02x%02x%02x%02x\n",
+			 ident_pub[1], ident_pub[2], ident_pub[3], ident_pub[4]);
+	} else {
+		snprintf(line, sizeof(line), "ident=(none)\n");
 	}
 	type_string(line);
 	/* Only while the owner's phone is in range (GREEN), and passwords are
