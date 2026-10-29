@@ -1,13 +1,16 @@
 package com.example.ble_beacon
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import androidx.activity.ComponentActivity
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -58,8 +61,9 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.fragment.app.FragmentActivity
 
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
@@ -107,6 +111,8 @@ class MainActivity : ComponentActivity() {
                 var blueText by remember { mutableStateOf(Config.getBlueThresholdText(context)) }
                 var status by remember { mutableStateOf("") }
                 var sending by remember { mutableStateOf(false) }
+                // Whether a credential set is saved on this phone (biometric-sealed).
+                var hasSavedCreds by remember { mutableStateOf(CredentialStore.hasCredentials(context)) }
 
                 val launcher = rememberLauncherForActivityResult(
                     ActivityResultContracts.RequestMultiplePermissions()
@@ -130,8 +136,37 @@ class MainActivity : ComponentActivity() {
                         status = "Bluetooth is off — turn it on, then Start Beacon."
                         return
                     }
-                    context.startService(Intent(context, BeaconService::class.java))
+                    Config.setBeaconEnabled(context, true)
+                    BeaconService.start(context)
                     status = "Secure beacon started (ID $beaconId)."
+                    requestBatteryExemption(context)
+                }
+
+                // Push a credential set to the dongle (over the sealed session). The
+                // dongle keeps it in RAM only, so this runs every time it's plugged in.
+                fun doSend(creds: CredentialStore.Creds, green: Int, blue: Int) {
+                    // Make sure the beacon is on, so the dongle finds this phone as soon
+                    // as its config window closes.
+                    Config.setBeaconEnabled(context, true)
+                    BeaconService.start(context)
+                    sending = true
+                    status = "Sending…"
+                    ConfigClient(context) { s, done, success ->
+                        status = s
+                        if (done) {
+                            sending = false
+                            if (success) {
+                                Config.save(context, green, blue)
+                                // Credentials are saved (biometric-sealed) on the phone,
+                                // so clear the input fields now that they've been sent.
+                                password = ""
+                                username2 = ""
+                                password2 = ""
+                                clearLogin2 = false
+                            }
+                        }
+                    }.send(creds.password, creds.username2, creds.password2,
+                        clearLogin2 = false, green, blue)
                 }
 
                 fun saveAndSend() {
@@ -141,7 +176,10 @@ class MainActivity : ComponentActivity() {
                     }
                     val green = greenText.trim().toIntOrNull()
                     val blue = blueText.trim().toIntOrNull()
+                    val activity = context.findFragmentActivity()
                     when {
+                        activity == null ->
+                            status = "Internal error: no activity for the fingerprint prompt."
                         password.length > Config.PASSWORD_MAX_LEN ->
                             status = "Password too long (max ${Config.PASSWORD_MAX_LEN})."
                         password2.length > Config.PASSWORD_MAX_LEN ->
@@ -155,27 +193,45 @@ class MainActivity : ComponentActivity() {
                         green <= blue ->
                             status = "Green (close) must be a stronger signal than Blue (far), " +
                                 "e.g. Green -71, Blue -100."
-                        else -> {
-                            // Make sure the beacon is on, so the dongle finds this phone
-                            // as soon as its config window closes.
-                            context.startService(Intent(context, BeaconService::class.java))
+                        password.isNotEmpty() -> {
+                            // New / changed credentials: seal them behind the fingerprint,
+                            // then send. Typing the password replaces the whole saved set.
+                            val creds = CredentialStore.Creds(
+                                password = password,
+                                username2 = if (clearLogin2) "" else username2,
+                                password2 = if (clearLogin2) "" else password2,
+                            )
                             sending = true
-                            status = "Sending…"
-                            ConfigClient(context) { s, done, success ->
-                                status = s
-                                if (done) {
+                            status = "Confirm your fingerprint to save…"
+                            CredentialStore.save(activity, creds) { ok, err ->
+                                if (!ok) {
                                     sending = false
-                                    if (success) {
-                                        Config.save(context, green, blue)
-                                        // The dongle has the credentials now; drop them here.
-                                        password = ""
-                                        username2 = ""
-                                        password2 = ""
-                                        clearLogin2 = false
-                                    }
+                                    status = err ?: "Couldn't save the password."
+                                } else {
+                                    hasSavedCreds = true
+                                    doSend(creds, green, blue)
                                 }
-                            }.send(password, username2, password2, clearLogin2, green, blue)
+                            }
                         }
+                        CredentialStore.hasCredentials(context) -> {
+                            // Reuse the saved credentials: unlock with the fingerprint,
+                            // then send. This is the usual every-plug-in case.
+                            sending = true
+                            status = "Confirm your fingerprint to send…"
+                            CredentialStore.load(activity) { creds, err ->
+                                if (creds == null) {
+                                    sending = false
+                                    hasSavedCreds = CredentialStore.hasCredentials(context)
+                                    status = err ?: "Couldn't read the saved password."
+                                } else {
+                                    doSend(creds, green, blue)
+                                }
+                            }
+                        }
+                        else ->
+                            status = "Enter your password above. It's saved on this phone " +
+                                "(unlocked by your fingerprint) and re-sent to the dongle each " +
+                                "time you plug it in."
                     }
                 }
 
@@ -284,8 +340,15 @@ class MainActivity : ComponentActivity() {
                         )
 
                         Text(
-                            text = "Passwords are sent to the dongle and NOT kept on this " +
-                                "phone. Leave a field blank to keep the dongle's current value.",
+                            text = if (hasSavedCreds) {
+                                "A password is saved on this phone, encrypted behind your " +
+                                    "fingerprint. Leave the fields blank and tap below to unlock " +
+                                    "and send it; or type to change the saved password."
+                            } else {
+                                "The dongle keeps your password in RAM only and forgets it when " +
+                                    "unplugged, so the phone stores it — encrypted behind your " +
+                                    "fingerprint — and re-sends it each time you plug the dongle in."
+                            },
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier
@@ -416,7 +479,11 @@ class MainActivity : ComponentActivity() {
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0))
                         ) {
                             Text(
-                                if (sending) "SENDING…" else "SAVE & SEND TO DONGLE",
+                                when {
+                                    sending -> "WORKING…"
+                                    password.isEmpty() && hasSavedCreds -> "UNLOCK & SEND TO DONGLE"
+                                    else -> "SAVE & SEND TO DONGLE"
+                                },
                                 fontWeight = FontWeight.Bold
                             )
                         }
@@ -438,8 +505,9 @@ class MainActivity : ComponentActivity() {
                         }
 
                         Text(
-                            text = "Hold the dongle's button while you tap Save (within a " +
-                                "minute of plugging it in).",
+                            text = "Plug the dongle in, HOLD its button, tap, then confirm your " +
+                                "fingerprint. The dongle stays in its config window until it has " +
+                                "received everything, so there's no rush.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(top = 4.dp)
@@ -485,6 +553,7 @@ class MainActivity : ComponentActivity() {
                             text = "STOP BEACON",
                             color = Color(0xFFF44336),
                             onClick = {
+                                Config.setBeaconEnabled(context, false)
                                 context.stopService(Intent(context, BeaconService::class.java))
                             }
                         )
@@ -493,6 +562,31 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+}
+
+/**
+ * Ask Android (once per start, until granted) not to battery-optimise the app:
+ * otherwise Doze / Samsung's "sleeping apps" can kill the beacon service and
+ * the dongle stops seeing the phone. Sideloaded app, so the Play policy on
+ * this permission doesn't apply.
+ */
+@SuppressLint("BatteryLife")
+private fun requestBatteryExemption(context: Context) {
+    val pm = context.getSystemService(PowerManager::class.java) ?: return
+    if (pm.isIgnoringBatteryOptimizations(context.packageName)) return
+    runCatching {
+        context.startActivity(
+            Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                .setData(Uri.parse("package:${context.packageName}"))
+        )
+    }
+}
+
+/** Unwrap a (possibly themed) Context to the hosting FragmentActivity, for BiometricPrompt. */
+private tailrec fun Context.findFragmentActivity(): FragmentActivity? = when (this) {
+    is FragmentActivity -> this
+    is android.content.ContextWrapper -> baseContext.findFragmentActivity()
+    else -> null
 }
 
 @Composable

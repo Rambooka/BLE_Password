@@ -94,9 +94,11 @@ class ConfigClient(
     }
 
     /**
-     * Credentials left blank are NOT written, so the dongle keeps its current
-     * ones (the phone doesn't store them). [clearLogin2] removes username 2 and
-     * password 2 from the dongle instead.
+     * Push the credentials (held on the phone, biometric-sealed; see
+     * CredentialStore) and thresholds to the dongle, which keeps them in RAM only
+     * and so needs them again after every power-cycle. An empty [username2] /
+     * [password2] simply isn't written, leaving the (blank-at-boot) dongle with
+     * none; [clearLogin2] additionally sends explicit empty writes to clear them.
      */
     fun send(
         password: String, username2: String, password2: String, clearLogin2: Boolean,

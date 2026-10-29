@@ -17,9 +17,15 @@
  * Remote configuration (companion Android app):
  *   The dongle is also a connectable BLE peripheral exposing a small GATT
  *   "config" service during the boot config window.  The phone writes the
- *   passwords, beacon name and thresholds; they apply immediately and are
- *   saved to a raw flash record (config_storage) that survives reboots and
- *   firmware updates.
+ *   passwords, beacon key and thresholds; they apply immediately.
+ *
+ *   SECRETS LIVE IN RAM ONLY (fw 1.3.0+).  The password(s), the second
+ *   username and the rolling-beacon key are NEVER written to flash; only the
+ *   RSSI thresholds persist (config_storage).  So a lost or stolen dongle,
+ *   once unplugged, holds no secret at all.  The price is that the phone must
+ *   re-send the secrets (button held) after every power-up / reboot / update:
+ *   the boot config window therefore stays open until they have been received,
+ *   instead of timing out into a useless blank "normal" mode.
  *
  *   A write is only accepted while (a) the boot config window is open AND
  *   (b) the dongle's own button is physically held down at the instant the
@@ -48,13 +54,14 @@
 #include <zephyr/bluetooth/att.h>
 #include <zephyr/usb/usbd.h>
 #include <zephyr/usb/class/usbd_hid.h>
-#include <zephyr/drivers/flash.h>
+#include <zephyr/drivers/hwinfo.h>
+#include <zephyr/drivers/watchdog.h>
+#include <zephyr/sys/reboot.h>
 #include <zephyr/fatal.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/dfu/mcuboot.h>
 #include <zephyr/mgmt/mcumgr/mgmt/callbacks.h>
 #include <zephyr/mgmt/mcumgr/mgmt/mgmt_defines.h>
-#include <pm_config.h>
 #include <app_version.h>
 #include <string.h>
 #include <stdio.h>
@@ -68,8 +75,6 @@ LOG_MODULE_REGISTER(ble_password, LOG_LEVEL_INF);
 
 /* ---- Configuration ---------------------------------------------------- */
 
-#define DEFAULT_PASSWORD     "12345678"   /* ENTER is appended automatically */
-
 #define DEFAULT_RSSI_GREEN_THRESHOLD (-71)   /* avg RSSI >= this → GREEN (close:  -10 to -77)  */
 #define DEFAULT_RSSI_BLUE_THRESHOLD  (-100)  /* avg RSSI >= this → RED   (far:    -78 to -100) */
                                              /* avg RSSI <  this → BLUE  (gone: below -100)    */
@@ -79,7 +84,6 @@ LOG_MODULE_REGISTER(ble_password, LOG_LEVEL_INF);
 #define RSSI_SAMPLES         20      /* number of samples in the running average */
 
 #define PASSWORD_MAX_LEN     64
-#define BEACON_NAME_MAX_LEN  31      /* only for the (retired) record field */
 
 /* Button press lengths (normal mode, released while GREEN):
  *   < MEDIUM_PRESS_MS                  → type password 1
@@ -96,18 +100,27 @@ LOG_MODULE_REGISTER(ble_password, LOG_LEVEL_INF);
 #define RSSI_MAX_DBM        (0)
 #define RSSI_HYSTERESIS     (4)
 
-/* ---- Runtime configuration (loaded from flash at boot, read-only after) -- */
-
-static char password_str[PASSWORD_MAX_LEN + 1]    = DEFAULT_PASSWORD;
+/* ---- Runtime configuration --------------------------------------------- */
+/* The thresholds are loaded from flash at boot.  The SECRETS below are NOT:
+ * they live in RAM only and start blank at every boot, re-sent by the phone
+ * through the gated GATT writes (see the file header).  So a powered-off dongle
+ * holds no secret.  With no beacon key, no beacon is ever accepted and the
+ * dongle stays BLUE; with no password it types nothing. */
+static char password_str[PASSWORD_MAX_LEN + 1];    /* RAM-only; "" = not set */
 static char password2_str[PASSWORD_MAX_LEN + 1];   /* optional; "" = not set */
 static char username2_str[PASSWORD_MAX_LEN + 1];   /* optional; typed + TAB before password 2 */
-/* Rolling-beacon key shared with the owner's phone (see beacon_auth.h).  No key
- * = no beacon is ever accepted: the dongle stays BLUE until the app pairs it. */
+/* Rolling-beacon key shared with the owner's phone (see beacon_auth.h).  RAM
+ * only: re-sent by the app every boot (the key-ID read returns empty, so the
+ * app always re-pairs). */
 static uint8_t beacon_key[BEACON_KEY_LEN];
 static bool beacon_key_set;
-static bool beacon_key_changed;   /* new key written this window → reset counters */
 static int8_t rssi_green_threshold = DEFAULT_RSSI_GREEN_THRESHOLD;
 static int8_t rssi_blue_threshold  = DEFAULT_RSSI_BLUE_THRESHOLD;
+
+/* The config window stays open until the phone has delivered the essential
+ * secrets (password + beacon key, button held).  These track that. */
+static volatile bool pw_received;
+static volatile bool key_received;
 
 /* ---- GATT config service UUIDs ----------------------------------------- */
 /* Service:  9f1b0001-5c3a-4e8e-9c2a-1a2b3c4d5e6f
@@ -235,10 +248,11 @@ static volatile bool config_mode;
 static volatile bool button_held;
 static struct bt_conn *cfg_conn;
 K_SEM_DEFINE(config_done_sem, 0, 1);
+/* The window no longer has a fixed timeout (RAM-only secrets: a timed-out dongle
+ * would be useless/blank).  It stays open until the phone has sent the password
+ * and beacon key, at which point on_disconnected gives config_done_sem.  This is
+ * just the polling chunk the waiter re-checks the DFU deadline on. */
 #define CONFIG_WINDOW_MS 60000
-/* A button tap shorter than this (ms) during the config window exits it early;
- * a longer hold is the "authorize write" gate instead. */
-#define CFG_EXIT_TAP_MS  500
 
 /* Firmware update.  MCUmgr/SMP is locked until the DFU-arm characteristic is
  * written (button held).  Arming remembers the phone's address, keeps the
@@ -258,17 +272,17 @@ static atomic_t scan_fmt_count;    /* rolling beacons from ANY phone (our format
 static atomic_t scan_match_count;  /* beacons that verified with our key and were fresh */
 static atomic_t scan_stale_count;  /* verified, but counter not newer (replay / repeat) */
 
-/* Rolling-beacon counter (replay protection).  A beacon is accepted only if its
- * counter is >= the last accepted one (the phone repeats a value while its CPU
- * sleeps) AND > the floor.  The floor jumps to the last accepted counter at
- * every lock (left GREEN / beacon lost), so after the owner walks away only a
- * NEWER counter brings the dongle back — a recording can't.  The floor is also
- * persisted (append-only log of uint32 words in two ping-pong pages after the
- * config record; see ctr_log_*()) so that holds across a reboot. */
+/* Rolling-beacon counter (replay protection, RAM only).  A beacon is accepted
+ * only if its counter is >= the last accepted one (the phone repeats a value
+ * while its CPU sleeps) AND > the floor.  The floor jumps to the last accepted
+ * counter at every lock (left GREEN / beacon lost), so after the owner walks
+ * away only a NEWER counter brings the dongle back — a recording can't.  Nothing
+ * is persisted: both start at 0 each boot.  Cross-reboot replay is covered
+ * instead by the RAM-only beacon key — after a reboot no beacon is accepted at
+ * all until the owner re-provisions (present, with a fresh ~now counter), which
+ * ratchets the last-accepted counter past any older recording. */
 static volatile uint32_t beacon_ctr_last;  /* highest accepted counter */
-static uint32_t beacon_ctr_floor;          /* from flash at boot */
-static volatile uint32_t ctr_logged;       /* highest counter written to flash */
-#define CTR_LOG_INTERVAL_S 300   /* also log every 5 min while the phone is present */
+static uint32_t beacon_ctr_floor;
 
 /* ---- RSSI running average (ring buffer, BT thread only) ---------------- */
 
@@ -298,6 +312,65 @@ static int8_t rssi_avg_update(int8_t sample)
 	int8_t avg = (int8_t)(sum / rssi_count);
 	rssi_last_avg = avg;
 	return avg;
+}
+
+/* ---- Watchdog: fail closed --------------------------------------------- */
+/* If the firmware hangs or crashes, the dongle can't lock the PC when the
+ * owner walks away.  So a hardware watchdog resets it, and a boot caused by
+ * the watchdog locks the PC (we may have missed the owner leaving).  Fed by a
+ * periodic system-workqueue job and by every HID keystroke (the status dump
+ * runs on the workqueue for several seconds).  MCUboot keeps feeding it during
+ * a firmware swap (BOOT_WATCHDOG_FEED), so BLE updates are unaffected.  The
+ * fatal-error handler spins with interrupts off, so a crash also ends in a
+ * watchdog reset. */
+#define WDT_TIMEOUT_MS 8000
+#define WDT_FEED_MS    1000
+
+static const struct device *const wdt_dev = DEVICE_DT_GET(DT_NODELABEL(wdt0));
+static int wdt_channel = -1;
+static bool reset_by_watchdog;
+static uint32_t boot_reset_cause;   /* hwinfo RESET_* bits, for the status dump */
+
+static void wdt_feed_now(void)
+{
+	if (wdt_channel >= 0) {
+		(void)wdt_feed(wdt_dev, wdt_channel);
+	}
+}
+
+static void wdt_feed_fn(struct k_work *w);
+K_WORK_DELAYABLE_DEFINE(wdt_feed_work, wdt_feed_fn);
+
+static void wdt_feed_fn(struct k_work *w)
+{
+	ARG_UNUSED(w);
+	wdt_feed_now();
+	k_work_schedule(&wdt_feed_work, K_MSEC(WDT_FEED_MS));
+}
+
+static void watchdog_start(void)
+{
+	/* Read (then clear: RESETREAS accumulates) why we booted. */
+	if (hwinfo_get_reset_cause(&boot_reset_cause) == 0) {
+		reset_by_watchdog = (boot_reset_cause & RESET_WATCHDOG) != 0;
+		(void)hwinfo_clear_reset_cause();
+	}
+
+	if (!device_is_ready(wdt_dev)) {
+		return;
+	}
+	const struct wdt_timeout_cfg cfg = {
+		.window = { .min = 0, .max = WDT_TIMEOUT_MS },
+		.callback = NULL,
+		.flags = WDT_FLAG_RESET_SOC,
+	};
+	int ch = wdt_install_timeout(wdt_dev, &cfg);
+
+	if (ch < 0 || wdt_setup(wdt_dev, WDT_OPT_PAUSE_HALTED_BY_DBG) != 0) {
+		return;
+	}
+	wdt_channel = ch;
+	k_work_schedule(&wdt_feed_work, K_NO_WAIT);
 }
 
 /* ---- Semaphore: button press while green triggers typing --------------- */
@@ -372,7 +445,6 @@ static void send_key(uint8_t modifier, uint8_t keycode); /* forward declaration 
 static bool ascii_to_hid(char c, uint8_t *mod, uint8_t *key); /* forward decl */
 static void type_string(const char *s); /* forward declaration */
 static void type_full_status(void); /* forward declaration */
-static void ctr_log_request(void);  /* forward declaration */
 
 /* ---- Win+L lock work (runs in system work queue, safe to sleep) -------- */
 
@@ -396,10 +468,8 @@ static void beacon_lost_fn(struct k_work *w)
 	LOG_INF("Beacon lost — locking computer");
 	k_work_submit(&lock_work);
 	/* From now on only a NEWER counter counts (a sleeping phone repeats its
-	 * last one, and a recording of it must not unlock anything), and persist
-	 * it so that also holds across a reboot. */
+	 * last one, and a recording of it must not unlock anything). */
 	beacon_ctr_floor = beacon_ctr_last;
-	ctr_log_request();
 }
 
 K_WORK_DELAYABLE_DEFINE(beacon_lost_work, beacon_lost_fn);
@@ -561,17 +631,13 @@ static void scan_recv(const struct bt_le_scan_recv_info *info,
 		return;   /* another phone's beacon (or a forgery) */
 	}
 	/* Fresh = not older than the newest accepted one (a sleeping phone repeats
-	 * its last counter) and newer than the floor (raised at every lock, restored
-	 * from flash at boot). */
+	 * its last counter) and newer than the floor (raised at every lock). */
 	if (ctx.ctr <= beacon_ctr_floor || ctx.ctr < beacon_ctr_last) {
 		atomic_inc(&scan_stale_count);
 		return;
 	}
 	beacon_ctr_last = ctx.ctr;
 	atomic_inc(&scan_match_count);
-	if (ctx.ctr - ctr_logged >= CTR_LOG_INTERVAL_S) {
-		ctr_log_request();
-	}
 
 	/* Record that the configured beacon is present (gates config writes). */
 	last_beacon_seen_ms = k_uptime_get();
@@ -608,7 +674,6 @@ static void scan_recv(const struct bt_le_scan_recv_info *info,
 		LOG_INF("Left GREEN (state=%d) — locking computer", new_state);
 		k_work_submit(&lock_work);
 		beacon_ctr_floor = beacon_ctr_last;   /* see beacon_lost_fn */
-		ctr_log_request();
 	}
 
 	k_work_reschedule(&beacon_lost_work, K_MSEC(BEACON_TIMEOUT_MS));
@@ -624,51 +689,17 @@ static struct bt_le_scan_cb scan_cbs = {
 /* ---- Config state ------------------------------------------------------ */
 
 /* GATT write handlers update the live variables directly (safe: during the
- * config window nothing else reads them) and set config_dirty; the flash save
- * happens at the end of the config window with the radio off. */
-static volatile bool config_dirty;  /* set when config changed, cleared after flash save */
-static volatile bool cfg_loaded;    /* true if valid config was loaded from flash */
+ * config window nothing else reads them).  NOTHING is persisted (fw 1.3.0+):
+ * both the secrets and the RSSI thresholds live in RAM only and are re-sent by
+ * the phone every boot (see the file header).  So there is no flash record, no
+ * save step, and config_storage is left unused — a powered-off dongle holds no
+ * configuration at all. */
 
-/* ---- Raw-flash persistence --------------------------------------------- */
-/* One raw record in the 'config_storage' partition, pinned by the static
- * partition maps (pm_static_*.yml) at 0xDC000 on both boards: after MCUboot's
- * two image slots and, on the official dongle, below the Nordic bootloader
- * (0xE0000).  NVS/settings are not used (see CLAUDE.md). */
-/* Only the current layout is accepted (pre-1.2 records were dropped in 1.2.1:
- * they hold no beacon key, so such a dongle must be set up again anyway).  If
- * the layout ever changes, APPEND fields and bump the magic. */
-#define CFG_MAGIC      0xB1E50006u
-#define STORAGE_OFFSET PM_CONFIG_STORAGE_ADDRESS
-#define STORAGE_ERASE  4096
-BUILD_ASSERT(PM_CONFIG_STORAGE_ADDRESS == 0xDC000,
-	     "config_storage moved — existing dongles would lose their saved config");
-
-struct persist_cfg {
-	uint32_t magic;
-	int8_t   green;
-	int8_t   blue;
-	char     password[PASSWORD_MAX_LEN + 1];    /* 65 */
-	char     beacon[BEACON_NAME_MAX_LEN + 1];   /* 32, unused since v6 (was the beacon name) */
-	char     password2[PASSWORD_MAX_LEN + 1];   /* 65, new in v4 */
-	char     username2[PASSWORD_MAX_LEN + 1];   /* 65, new in v5 */
-	uint8_t  beacon_key[BEACON_KEY_LEN];        /* 16, new in v6 */
-	uint8_t  beacon_key_set;                    /* new in v6 */
-};
-
-BUILD_ASSERT(sizeof(struct persist_cfg) % 4 == 0, "persist_cfg must be 4-aligned");
-
-static const struct device *flash_dev =
-	DEVICE_DT_GET(DT_CHOSEN(zephyr_flash_controller));
-
-/* Validate the live config: non-empty password, thresholds in a sane dBm
- * window, and green strictly stronger (greater) than blue.  Used to reject bad
- * persisted data on load and bad settings before a flash save.  (No beacon key
- * is valid too: the dongle just never sees its phone until it is paired.) */
-static bool config_is_sane(void)
+/* Validate the thresholds: both in a sane dBm window and green strictly stronger
+ * (greater) than blue.  Used at the end of the config window to reject a bad
+ * threshold combination before entering normal mode. */
+static bool thresholds_sane(void)
 {
-	if (password_str[0] == '\0') {
-		return false;
-	}
 	if (rssi_green_threshold < RSSI_MIN_DBM || rssi_green_threshold > RSSI_MAX_DBM) {
 		return false;
 	}
@@ -679,204 +710,6 @@ static bool config_is_sane(void)
 		return false;
 	}
 	return true;
-}
-
-/* Load persisted config into the live variables.  Read-only, call before
- * bt_enable(). */
-static void config_load_from_flash(void)
-{
-	struct persist_cfg cfg;
-
-	if (!device_is_ready(flash_dev)) {
-		LOG_ERR("flash device not ready");
-		return;
-	}
-	int rc = flash_read(flash_dev, STORAGE_OFFSET, &cfg, sizeof(cfg));
-	if (rc != 0) {
-		LOG_ERR("flash_read failed (%d)", rc);
-		return;
-	}
-	if (cfg.magic != CFG_MAGIC) {
-		LOG_INF("No saved config (magic=0x%08x) — using defaults", cfg.magic);
-		return;
-	}
-
-	/* Record fields and live buffers are the same size, so a terminated
-	 * whole-buffer copy is bounded by construction. */
-	BUILD_ASSERT(sizeof(password_str) == sizeof(cfg.password));
-	BUILD_ASSERT(sizeof(password2_str) == sizeof(cfg.password2));
-	BUILD_ASSERT(sizeof(username2_str) == sizeof(cfg.username2));
-	BUILD_ASSERT(sizeof(beacon_key) == sizeof(cfg.beacon_key));
-	cfg.password[PASSWORD_MAX_LEN] = '\0';
-	cfg.password2[PASSWORD_MAX_LEN] = '\0';
-	cfg.username2[PASSWORD_MAX_LEN] = '\0';
-	memcpy(password_str, cfg.password, sizeof(password_str));
-	memcpy(password2_str, cfg.password2, sizeof(password2_str));
-	memcpy(username2_str, cfg.username2, sizeof(username2_str));
-	beacon_key_set = (cfg.beacon_key_set == 1);
-	if (beacon_key_set) {
-		memcpy(beacon_key, cfg.beacon_key, sizeof(beacon_key));
-	}
-	rssi_green_threshold = cfg.green;
-	rssi_blue_threshold = cfg.blue;
-	memset(&cfg, 0, sizeof(cfg));   /* don't leave secrets on the stack */
-
-	/* Guard against corrupt / out-of-range persisted data — fall back to the
-	 * compiled defaults rather than running with nonsense thresholds. */
-	if (!config_is_sane()) {
-		LOG_WRN("Persisted config invalid — reverting to defaults");
-		strcpy(password_str, DEFAULT_PASSWORD);
-		password2_str[0] = '\0';
-		username2_str[0] = '\0';
-		memset(beacon_key, 0, sizeof(beacon_key));
-		beacon_key_set = false;
-		rssi_green_threshold = DEFAULT_RSSI_GREEN_THRESHOLD;
-		rssi_blue_threshold = DEFAULT_RSSI_BLUE_THRESHOLD;
-		return;
-	}
-
-	cfg_loaded = true;
-	LOG_INF("Loaded config from flash (beacon key %s)",
-		beacon_key_set ? "set" : "not set");
-}
-
-/* Save the live config to flash.  Erase+write — MUST be called with the radio
- * fully off (bt_disable), because flash is un-synced and the erase stalls the
- * CPU. */
-static void config_save_to_flash(void)
-{
-	struct persist_cfg cfg;
-
-	memset(&cfg, 0, sizeof(cfg));
-	cfg.magic = CFG_MAGIC;
-	cfg.green = rssi_green_threshold;
-	cfg.blue  = rssi_blue_threshold;
-	strncpy(cfg.password, password_str, PASSWORD_MAX_LEN);
-	strncpy(cfg.password2, password2_str, PASSWORD_MAX_LEN);
-	strncpy(cfg.username2, username2_str, PASSWORD_MAX_LEN);
-	memcpy(cfg.beacon_key, beacon_key, sizeof(cfg.beacon_key));
-	cfg.beacon_key_set = beacon_key_set ? 1 : 0;
-
-	if (!device_is_ready(flash_dev)) {
-		LOG_ERR("flash device not ready");
-		return;
-	}
-
-	int rc = flash_erase(flash_dev, STORAGE_OFFSET, STORAGE_ERASE);
-	if (rc == 0) {
-		rc = flash_write(flash_dev, STORAGE_OFFSET, &cfg, sizeof(cfg));
-	}
-	memset(&cfg, 0, sizeof(cfg));
-	LOG_INF("Saved config to flash rc=%d", rc);
-}
-
-/* ---- Beacon counter log (replay protection across reboots) ------------- */
-/* Two 4 KB pages after the config record hold an append-only list of uint32
- * counters (erased flash = 0xFFFFFFFF = empty slot).  The floor is the largest
- * value in either page.  When the active page fills, the OTHER page is erased
- * and written first, so a power cut mid-switch still leaves the old maximum.
- * ~1 entry per lock event plus one per 5 min of presence → a page lasts days,
- * far inside the flash's 10k erase cycles. */
-#define CTR_LOG_PAGE_A  (STORAGE_OFFSET + 0x1000)
-#define CTR_LOG_PAGE_B  (STORAGE_OFFSET + 0x2000)
-#define CTR_LOG_WORDS   (STORAGE_ERASE / sizeof(uint32_t))
-#define CTR_EMPTY       0xFFFFFFFFu
-BUILD_ASSERT(STORAGE_OFFSET + 0x3000 <= PM_CONFIG_STORAGE_ADDRESS + PM_CONFIG_STORAGE_SIZE,
-	     "counter log must fit in config_storage");
-
-static off_t ctr_log_page = CTR_LOG_PAGE_A;  /* active page */
-static size_t ctr_log_next;                  /* next free word in it */
-
-/* Scan one page: returns its largest entry and the number of used words. */
-static uint32_t ctr_log_scan(off_t page, size_t *used)
-{
-	uint32_t chunk[64];
-	uint32_t max = 0;
-
-	*used = CTR_LOG_WORDS;
-	for (size_t base = 0; base < CTR_LOG_WORDS; base += ARRAY_SIZE(chunk)) {
-		if (flash_read(flash_dev, page + (off_t)(base * sizeof(uint32_t)),
-			       chunk, sizeof(chunk)) != 0) {
-			*used = 0;
-			return 0;
-		}
-		for (size_t i = 0; i < ARRAY_SIZE(chunk); i++) {
-			if (chunk[i] == CTR_EMPTY) {
-				if (*used == CTR_LOG_WORDS) {
-					*used = base + i;
-				}
-			} else if (chunk[i] > max) {
-				max = chunk[i];
-			}
-		}
-	}
-	return max;
-}
-
-/* Boot: load the floor and pick the page to append to.  Call before bt_enable. */
-static void ctr_log_load(void)
-{
-	size_t used_a, used_b;
-	uint32_t max_a = ctr_log_scan(CTR_LOG_PAGE_A, &used_a);
-	uint32_t max_b = ctr_log_scan(CTR_LOG_PAGE_B, &used_b);
-
-	if (max_b > max_a) {
-		ctr_log_page = CTR_LOG_PAGE_B;
-		ctr_log_next = used_b;
-		beacon_ctr_floor = max_b;
-	} else {
-		ctr_log_page = CTR_LOG_PAGE_A;
-		ctr_log_next = used_a;
-		beacon_ctr_floor = max_a;
-	}
-	ctr_logged = beacon_ctr_floor;
-	beacon_ctr_last = beacon_ctr_floor;
-}
-
-/* New phone key: the old phone's counters mean nothing now.  Radio must be off
- * (called from the config save path, inside bt_disable()). */
-static void ctr_log_reset(void)
-{
-	(void)flash_erase(flash_dev, CTR_LOG_PAGE_A, STORAGE_ERASE);
-	(void)flash_erase(flash_dev, CTR_LOG_PAGE_B, STORAGE_ERASE);
-	ctr_log_page = CTR_LOG_PAGE_A;
-	ctr_log_next = 0;
-	beacon_ctr_floor = 0;
-	beacon_ctr_last = 0;
-	ctr_logged = 0;
-}
-
-/* Workqueue: append the newest accepted counter if it isn't logged yet.  Flash
- * uses MPSL radio sync, so this is safe while scanning. */
-static void ctr_log_fn(struct k_work *w)
-{
-	ARG_UNUSED(w);
-	uint32_t v = beacon_ctr_last;
-
-	if (v <= ctr_logged || v == CTR_EMPTY) {
-		return;
-	}
-	if (ctr_log_next >= CTR_LOG_WORDS) {
-		off_t other = (ctr_log_page == CTR_LOG_PAGE_A) ? CTR_LOG_PAGE_B : CTR_LOG_PAGE_A;
-
-		if (flash_erase(flash_dev, other, STORAGE_ERASE) != 0) {
-			return;
-		}
-		ctr_log_page = other;
-		ctr_log_next = 0;
-	}
-	if (flash_write(flash_dev, ctr_log_page + (off_t)(ctr_log_next * sizeof(uint32_t)),
-			&v, sizeof(v)) == 0) {
-		ctr_log_next++;
-		ctr_logged = v;
-	}
-}
-
-K_WORK_DEFINE(ctr_log_work, ctr_log_fn);
-
-static void ctr_log_request(void)
-{
-	k_work_submit(&ctr_log_work);
 }
 
 /* ---- Encrypted config session (ECDH, see cfg_crypto.h) ----------------- */
@@ -1036,7 +869,7 @@ static ssize_t write_password(struct bt_conn *conn,
 	memcpy(password_str, pt, (size_t)n);
 	password_str[n] = '\0';
 	memset(pt, 0, sizeof(pt));
-	config_dirty = true;
+	pw_received = true;   /* RAM only; one of the two secrets the window waits for */
 
 	LOG_INF("Password write accepted (%d chars)", (int)n);
 	return len;
@@ -1069,8 +902,7 @@ static ssize_t write_optional_str(const void *buf, uint16_t len,
 
 	memcpy(live, pt, (size_t)n);
 	live[n] = '\0';
-	memset(pt, 0, sizeof(pt));
-	config_dirty = true;
+	memset(pt, 0, sizeof(pt));   /* RAM only, optional: doesn't gate the window */
 
 	LOG_INF("%s write accepted (%d chars)", what, (int)n);
 	return len;
@@ -1136,13 +968,10 @@ static ssize_t write_beacon_key(struct bt_conn *conn,
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 
-	if (!beacon_key_set || memcmp(beacon_key, key, BEACON_KEY_LEN) != 0) {
-		beacon_key_changed = true;
-	}
 	memcpy(beacon_key, key, BEACON_KEY_LEN);
 	memset(key, 0, sizeof(key));
 	beacon_key_set = true;
-	config_dirty = true;
+	key_received = true;   /* RAM only; the other secret the window waits for */
 
 	LOG_INF("Beacon key written");
 	return len;
@@ -1194,8 +1023,7 @@ static ssize_t write_threshold(struct bt_conn *conn,
 		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 	}
 
-	*live = v;
-	config_dirty = true;
+	*live = v;   /* RAM only; applied live, never persisted */
 
 	LOG_INF("%s write accepted (%d dBm)", what, *live);
 	return len;
@@ -1370,16 +1198,17 @@ static int start_advertising(void)
 	return err;
 }
 
-/* While DFU is armed, advertising is restarted after each disconnect so the
- * phone's SMP client can (re)connect.  Done from the workqueue once the old
- * connection object is recycled (with one connection allowed, advertising
- * can't restart before then). */
+/* Advertising is restarted after a disconnect so the phone can (re)connect:
+ * while DFU is armed (for the SMP client), and also when the phone dropped out
+ * before finishing pairing (RAM-only secrets: the window is still open).  Done
+ * from the workqueue once the old connection object is recycled (with one
+ * connection allowed, advertising can't restart before then). */
 static volatile bool adv_restart_pending;
 
 static void adv_restart_fn(struct k_work *w)
 {
 	ARG_UNUSED(w);
-	if (!config_mode || !dfu_armed) {
+	if (!config_mode) {
 		return;
 	}
 	ble_adv_err = start_advertising();
@@ -1445,8 +1274,16 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 		adv_restart_pending = true;
 		return;
 	}
-	/* End the config window early once the phone is done and disconnects. */
-	k_sem_give(&config_done_sem);
+	/* RAM-only secrets: only close the window once the phone has actually
+	 * delivered the password AND the beacon key (button held).  If it dropped
+	 * out before that (a fumbled pairing), keep the window open and re-advertise
+	 * so it can reconnect and finish — a blank dongle must not fall through to
+	 * normal mode. */
+	if (pw_received && key_received) {
+		k_sem_give(&config_done_sem);
+	} else {
+		adv_restart_pending = true;
+	}
 }
 
 static void on_recycled(void)
@@ -1475,24 +1312,14 @@ static void button_cb(struct input_event *evt, void *user_data)
 
 	bool pressed = (evt->value == 1);
 
-	/* During the config window the button has two roles:
-	 *   - held down  = the physical "authorize write" gate (BLE config writes
-	 *     are only accepted while it is held; see the GATT write handlers);
-	 *   - short tap (< CFG_EXIT_TAP_MS) = exit the config window early into
-	 *     normal mode.
+	/* During the config window the button is only the physical "authorize write"
+	 * gate: BLE config writes are accepted only while it is held (see the GATT
+	 * write handlers), and holding it also sets the "held" advert flag so the app
+	 * connects to this dongle.  It no longer exits the window early — with
+	 * RAM-only secrets the window must stay open until the phone has sent them.
 	 * It does not type the password or arm the status dump in this mode. */
 	if (config_mode) {
-		static int64_t press_ms;
-
-		if (pressed) {
-			press_ms = k_uptime_get();
-			button_held = true;
-		} else {
-			button_held = false;
-			if ((k_uptime_get() - press_ms) < CFG_EXIT_TAP_MS) {
-				k_sem_give(&config_done_sem);
-			}
-		}
+		button_held = pressed;
 		k_work_submit(&adv_flag_work);
 		return;
 	}
@@ -1622,6 +1449,7 @@ static void usb_msg_cb(struct usbd_context *const usbd_ctx,
 
 static void send_key(uint8_t modifier, uint8_t keycode)
 {
+	wdt_feed_now();   /* typing in progress = alive (status dump takes seconds) */
 	memset(hid_report, 0, KB_REPORT_COUNT);
 	hid_report[KB_MOD_KEY]   = modifier;
 	hid_report[KB_KEY_CODE1] = keycode;
@@ -1690,9 +1518,10 @@ K_THREAD_DEFINE(type_tid, 1024, type_thread_fn, NULL, NULL, NULL, 7, 0, 0);
  *   2 blinks = BLE scan (observer) failed to start
  * A *blinking* red is always abnormal (normal "far" state is red SOLID).
  */
-/* Any fatal fault (hard fault, assert, stack overflow, …) fast-flashes RED
- * forever, so a crash is instantly distinguishable from a hang (LEDs frozen)
- * or normal operation. Runs with the scheduler dead, so it busy-waits. */
+/* Any fatal fault (hard fault, assert, stack overflow, …) fast-flashes RED, so
+ * a crash is visibly different from normal operation.  It busy-waits with the
+ * scheduler dead, so nothing feeds the watchdog: within WDT_TIMEOUT_MS the chip
+ * resets, and that boot locks the PC (fail closed). */
 void k_sys_fatal_error_handler(unsigned int reason, const struct arch_esf *esf)
 {
 	ARG_UNUSED(reason);
@@ -1723,7 +1552,9 @@ static void error_halt_blink(int count)
 	gpio_pin_set_dt(&led_red,   0);
 #endif
 
-	while (true) {
+	/* Show the code a few times, then reboot and try again (the BLE stack
+	 * may come up next time) rather than sit there unable to see the phone. */
+	for (int round = 0; round < 5; round++) {
 		for (int i = 0; i < count; i++) {
 			gpio_pin_set_dt(&ALERT_LED, 1);
 			k_msleep(200);
@@ -1732,6 +1563,7 @@ static void error_halt_blink(int count)
 		}
 		k_msleep(1200);
 	}
+	sys_reboot(SYS_REBOOT_COLD);
 }
 
 /* ---- Deferred BLE bring-up --------------------------------------------- */
@@ -1749,10 +1581,19 @@ static void ble_init_thread_fn(void *a, void *b, void *c)
 	/* Let USB finish enumerating before we touch the radio or flash. */
 	k_msleep(3000);
 
-	/* LOAD persisted config BEFORE bt_enable(), i.e. with the radio fully off
-	 * (flash is un-synced).  Read-only, so it cannot hang. */
-	config_load_from_flash();
-	ctr_log_load();
+	/* Booted by the watchdog: the firmware hung or crashed, so it may have
+	 * missed the owner leaving.  Lock now (fail closed); the owner unlocks with
+	 * the button as usual once the phone is seen again. */
+	if (reset_by_watchdog) {
+		for (int i = 0; i < 20 && !hid_ready; i++) {
+			k_msleep(500);
+		}
+		k_work_submit(&lock_work);
+	}
+
+	/* Nothing is loaded from flash: the thresholds start at their compiled
+	 * defaults and the secrets start blank; the phone re-sends everything during
+	 * this boot's config window (RAM-only config, see the file header). */
 
 	/* MCUboot: if this image was just installed as a test swap, mark it good
 	 * now that it has booted this far.  If it crashes before reaching here,
@@ -1780,21 +1621,23 @@ static void ble_init_thread_fn(void *a, void *b, void *c)
 	ble_adv_running = (ble_adv_err == 0);
 	LOG_INF("Config window open (%d s)", CONFIG_WINDOW_MS / 1000);
 
-	/* Wait for the window to elapse, or end early when the app disconnects or
-	 * the button is tapped.  Arming DFU extends the deadline (re-checked each
-	 * time the wait times out). */
-	int64_t window_end = k_uptime_get() + CONFIG_WINDOW_MS;
-
+	/* Wait until the phone has delivered the secrets: on_disconnected gives
+	 * config_done_sem once the password AND beacon key have arrived (button
+	 * held).  There is no plain timeout any more — with RAM-only secrets a blank
+	 * dongle would be useless, so it just keeps advertising until paired.  While
+	 * a firmware update is armed, honour its deadline so a stalled upload still
+	 * closes the window. */
 	while (true) {
-		int64_t deadline = window_end;
+		int64_t left = dfu_armed ? (dfu_deadline_ms - k_uptime_get())
+					 : CONFIG_WINDOW_MS;
 
-		if (dfu_armed && dfu_deadline_ms > deadline) {
-			deadline = dfu_deadline_ms;
+		if (dfu_armed && left <= 0) {
+			break;
 		}
-		int64_t left = deadline - k_uptime_get();
-
-		if (left <= 0 ||
-		    k_sem_take(&config_done_sem, K_MSEC(left)) == 0) {
+		if (left <= 0) {
+			left = CONFIG_WINDOW_MS;   /* poll chunk while waiting unprovisioned */
+		}
+		if (k_sem_take(&config_done_sem, K_MSEC(left)) == 0) {
 			break;
 		}
 	}
@@ -1812,48 +1655,38 @@ static void ble_init_thread_fn(void *a, void *b, void *c)
 		cfg_conn = NULL;
 	}
 
-	/* SAVE to flash.  The radio must be FULLY off during the flash erase/write
-	 * (un-synced flash + a ~85 ms CPU stall faults the running controller), so
-	 * bt_disable() first, then re-enable for scanning. */
-	if (config_dirty) {
-		config_dirty = false;
+	/* Nothing is persisted (RAM-only config), so there is no flash save step.  If
+	 * a bad threshold combination was written (green <= blue), don't run with it —
+	 * revert to the compiled defaults and signal rejection with a fast 6x
+	 * red/ALERT blink. */
+	bool provisioned = pw_received && key_received;
 
-		if (!config_is_sane()) {
-			/* Bad combination written during the window (out-of-range,
-			 * green<=blue, or empty password): do NOT persist — the next
-			 * boot keeps the previously-saved config.  Signal rejection
-			 * with a fast 6x red blink (3x green = accepted). */
-			LOG_WRN("Config invalid — not saving");
-			k_timer_stop(&led_timer);
-			for (int i = 0; i < 6; i++) {
-				gpio_pin_set_dt(&ALERT_LED, 1);
-				k_msleep(80);
-				gpio_pin_set_dt(&ALERT_LED, 0);
-				k_msleep(80);
-			}
-			k_timer_start(&led_timer, K_MSEC(LED_TICK_MS), K_MSEC(LED_TICK_MS));
-		} else {
-			bt_disable();
-			config_save_to_flash();
-			if (beacon_key_changed) {
-				beacon_key_changed = false;
-				ctr_log_reset();
-			}
-			ret = bt_enable(NULL);
-			if (ret) {
-				LOG_ERR("BLE re-enable failed (%d)", ret);
-				error_halt_blink(1);
-			}
-			/* Confirm save with 3 green blinks so it's safe to power-cycle. */
-			k_timer_stop(&led_timer);
-			for (int i = 0; i < 3; i++) {
-				gpio_pin_set_dt(&led_green, 1);
-				k_msleep(150);
-				gpio_pin_set_dt(&led_green, 0);
-				k_msleep(150);
-			}
-			k_timer_start(&led_timer, K_MSEC(LED_TICK_MS), K_MSEC(LED_TICK_MS));
+	if (!thresholds_sane()) {
+		LOG_WRN("Thresholds invalid — reverting to defaults");
+		rssi_green_threshold = DEFAULT_RSSI_GREEN_THRESHOLD;
+		rssi_blue_threshold = DEFAULT_RSSI_BLUE_THRESHOLD;
+		k_timer_stop(&led_timer);
+		for (int i = 0; i < 6; i++) {
+			gpio_pin_set_dt(&ALERT_LED, 1);
+			k_msleep(80);
+			gpio_pin_set_dt(&ALERT_LED, 0);
+			k_msleep(80);
 		}
+		k_timer_start(&led_timer, K_MSEC(LED_TICK_MS), K_MSEC(LED_TICK_MS));
+	}
+
+	/* Confirm a completed pairing (password + beacon key received) with 3 green
+	 * blinks, so the owner knows the dongle is provisioned and it's safe to
+	 * release the button.  (The window only closes this way once both arrived.) */
+	if (provisioned) {
+		k_timer_stop(&led_timer);
+		for (int i = 0; i < 3; i++) {
+			gpio_pin_set_dt(&led_green, 1);
+			k_msleep(150);
+			gpio_pin_set_dt(&led_green, 0);
+			k_msleep(150);
+		}
+		k_timer_start(&led_timer, K_MSEC(LED_TICK_MS), K_MSEC(LED_TICK_MS));
 	}
 
 	/* ---- NORMAL MODE: scan for the target beacon (proximity). */
@@ -1881,6 +1714,39 @@ K_THREAD_DEFINE(ble_init_tid, 4096, ble_init_thread_fn,   /* 4 KB: ECDH keygen *
 
 /* ---- HID status dump (triggered by 5-second button hold) --------------- */
 
+/* "Correct-Horse7" → "C***7": enough to tell which password is stored without
+ * typing it out (anyone at the desk could hold the button while the owner is
+ * nearby).  Under 4 characters, first + last would give most of it away. */
+static void mask_secret(const char *s, char *out, size_t out_len)
+{
+	size_t n = strlen(s);
+
+	if (n == 0) {
+		snprintf(out, out_len, "(not set)");
+	} else if (n < 4) {
+		snprintf(out, out_len, "***");
+	} else {
+		snprintf(out, out_len, "%c***%c", s[0], s[n - 1]);
+	}
+}
+
+static const char *reset_cause_name(uint32_t cause)
+{
+	if (cause & RESET_WATCHDOG) {
+		return "watchdog";
+	}
+	if (cause & RESET_SOFTWARE) {
+		return "software";   /* e.g. after a firmware update */
+	}
+	if (cause & RESET_PIN) {
+		return "pin";
+	}
+	if (cause & (RESET_POR | RESET_BROWNOUT)) {
+		return "power";
+	}
+	return cause ? "other" : "power";   /* no flag set = fresh power-on */
+}
+
 static void type_full_status(void)
 {
 	if (!hid_ready) {
@@ -1901,10 +1767,16 @@ static void type_full_status(void)
 	snprintf(line, sizeof(line), "fw=%s board=%s confirmed=%d\n",
 		 APP_VERSION_STRING, CONFIG_BOARD, (int)boot_is_img_confirmed());
 	type_string(line);
+	/* prov=1 once the phone has sent this boot's secrets (RAM-only; nothing is
+	 * persisted, so there is no "saved" state). */
 	snprintf(line, sizeof(line),
-		 "up_ms=%lld scan=%d adv=%d saved=%d hid=%d\n",
+		 "up_ms=%lld scan=%d adv=%d hid=%d prov=%d\n",
 		 (long long)k_uptime_get(), (int)ble_scan_running,
-		 (int)ble_adv_running, (int)cfg_loaded, (int)hid_ready);
+		 (int)ble_adv_running, (int)hid_ready,
+		 (int)(pw_received && key_received));
+	type_string(line);
+	snprintf(line, sizeof(line), "boot=%s watchdog=%s\n",
+		 reset_cause_name(boot_reset_cause), wdt_channel >= 0 ? "on" : "OFF");
 	type_string(line);
 	/* ads = everything heard; beacons = rolling beacons from any phone;
 	 * match = ours, verified + fresh; stale = ours but an old counter. */
@@ -1926,16 +1798,20 @@ static void type_full_status(void)
 		snprintf(line, sizeof(line), "beacon_key=(not set: pair from the app)\n");
 	}
 	type_string(line);
-	/* Same rule as typing the password: only reveal it while the owner's
-	 * phone is in range (GREEN). */
+	/* Only while the owner's phone is in range (GREEN), and passwords are
+	 * never typed in full: first and last character only (mask_secret).
+	 * Username 2 isn't a secret, so it's shown so it can be checked. */
 	if (st == STATE_GREEN) {
-		snprintf(line, sizeof(line), "password=%s\n", password_str);
+		char masked[16];
+
+		mask_secret(password_str, masked, sizeof(masked));
+		snprintf(line, sizeof(line), "password=%s\n", masked);
 		type_string(line);
 		snprintf(line, sizeof(line), "username2=%s\n",
 			 username2_str[0] ? username2_str : "(not set)");
 		type_string(line);
-		snprintf(line, sizeof(line), "password2=%s\n",
-			 password2_str[0] ? password2_str : "(not set)");
+		mask_secret(password2_str, masked, sizeof(masked));
+		snprintf(line, sizeof(line), "password2=%s\n", masked);
 	} else {
 		snprintf(line, sizeof(line), "password=(hidden: phone not in range)\n");
 	}
@@ -1958,6 +1834,8 @@ static void type_full_status(void)
 int main(void)
 {
 	int ret;
+
+	watchdog_start();
 
 	/* Configure LEDs. */
 	(void)gpio_pin_configure_dt(&led_green, GPIO_OUTPUT_INACTIVE);

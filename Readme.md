@@ -26,9 +26,9 @@ manufacturer data, company ID 0xFFFF:   'B' 'P' 01  counter[4]  tag[8]
 tag = first 8 bytes of HMAC-SHA256(key, 'B' 'P' 01 counter)
 ```
 
-- **key** is 16 random bytes made by the phone and written to the dongle when you save (button held). On the phone it is stored encrypted under an Android Keystore key.
+- **key** is 16 random bytes made by the phone and written to the dongle when you save (button held). On the phone it is stored encrypted under an Android Keystore key. On the dongle it lives in **RAM only** (firmware 1.3.0+), so the phone re-sends it every time the dongle is plugged in.
 - **counter** is the phone's clock in seconds (UTC, so time zones and daylight saving don't affect it). It never goes backwards, even if the clock is set back.
-- The dongle accepts a beacon only if the tag verifies with **its** key and the counter is fresh. After every lock, the counter must be newer than the last one accepted. This floor is also saved to flash, so it survives a reboot.
+- The dongle accepts a beacon only if the tag verifies with **its** key and the counter is fresh. After every lock, the counter must be newer than the last one accepted. (Since 1.3.0 this floor is kept in RAM only; a reboot wipes the dongle's key entirely, so it accepts nothing until you re-pair — present, with a current counter — which by itself rules out an old recording.)
 
 As a result:
 
@@ -41,6 +41,12 @@ accepts while it's still seeing you. A wake-up alarm (about once a minute) and
 the screen turning on both advance the counter. **If the LED stays blue when
 you sit back down, wake your phone's screen.**
 
+The beacon restarts by itself after the phone reboots, after an app update,
+and when Bluetooth is switched back on, as long as you left it on. When you
+start it, the app asks to be exempt from battery optimisation, so Android
+doesn't kill it in the background. On Samsung phones also check the app's
+battery setting is **Unrestricted**.
+
 ---
 
 ## Using it
@@ -49,13 +55,13 @@ you sit back down, wake your phone's screen.**
 
 | LED | Meaning |
 |---|---|
-| Blinking blue | Config window (first ~60 s after plug-in): the app can connect |
+| Blinking blue | Config window (after plug-in): the app can connect. Stays open until the phone has sent the password + beacon key |
 | Solid blue | Phone's beacon not seen |
 | Solid red | Phone seen but too far away |
 | Solid green | Phone is close: the button will type |
 | Fast blink | Firmware update armed / in progress |
-| 3 green blinks | Settings saved |
-| 6 fast red blinks | Settings rejected (invalid values), nothing saved |
+| 3 green blinks | Pairing complete (password + beacon key received) |
+| 6 fast red blinks | Threshold values rejected (e.g. green ≤ blue); defaults used |
 
 Zones use an averaged RSSI with 4 dB of hysteresis, so a borderline signal
 doesn't flicker between zones.
@@ -77,6 +83,13 @@ Timing is by how long you hold before releasing:
 
 Leaving the green zone, or losing the beacon for 5 s, locks the PC with Win+L.
 
+**Fail-safe (1.2.2+):** a hardware watchdog resets the dongle if the firmware
+ever hangs or crashes. The boot after a watchdog reset **locks the PC**,
+because the dongle may have missed you leaving. You unlock as usual with the
+button. Unplugging the dongle can't lock the PC, so for belt and braces also
+turn on Windows **Dynamic Lock** (Settings → Accounts → Sign-in options,
+paired to your phone).
+
 Typing uses a US keyboard layout map. Set the PC to a US layout, or avoid
 characters that differ on yours.
 
@@ -86,16 +99,21 @@ Open a text editor and hold the button for 5 s. The dongle types:
 
 ```
 === BLE_Password ===
-fw=1.2.0 board=nrf52840dongle confirmed=1
-up_ms=... scan=1 adv=0 saved=1 hid=1
+fw=1.3.0 board=nrf52840dongle confirmed=1
+up_ms=... scan=1 adv=0 hid=1 prov=1
+boot=power watchdog=on
 ads=... beacons=... match=... stale=...
 beacon_key=2fcd11b7 ctr=... floor=...
-password=(hidden: phone not in range)
-green=-76 blue=-100 state=RED seen_ago=120
-averaged_rssi=-82
+password=C***7
+username2=jsmith
+password2=(not set)
+green=-76 blue=-100 state=GREEN seen_ago=120
+averaged_rssi=-58
 ```
 
-- Stored credentials are printed **only while the phone is in the green zone**.
+- **Passwords are never typed out in full.** You see only the first and last character (`C***7`), enough to tell which password is stored. Passwords under 4 characters show as `***`. These lines, and username 2, appear only while the phone is in the green zone; otherwise you get `password=(hidden: phone not in range)`.
+- `prov=1` means the phone has sent this boot's secrets (they live in RAM only, so it reads `0` until you've paired after each plug-in).
+- `boot` is why the dongle last started: `power`, `software` (e.g. after an update), `pin` or `watchdog`. `watchdog=on` means the fail-safe is running.
 - `beacons` counts rolling beacons from any phone. `match` counts yours, verified and fresh. `stale` counts yours with an old counter (a sleeping phone, or a replay).
 - `beacon_key` is the paired phone's ID. The app shows the same ID.
 - `averaged_rssi` is the running average the zones are based on. It reads `gone` once the beacon hasn't been seen for 5 s.
@@ -103,16 +121,24 @@ averaged_rssi=-82
 
 ### Configuring with the app
 
-1. Plug in the dongle. It opens a **60 s config window** (blinking blue).
-2. In the app, enter the green and blue thresholds (dBm), and any credentials you want to change.
-3. **Hold the dongle's button** and tap **Save & Send to Dongle**. Writes are only accepted while the button is physically held and the dongle is within its config period. That's the proof that whoever is configuring the dongle owns it. The first save also **pairs** the dongle with your phone's beacon key. A dongle that isn't paired never sees any phone. One phone can be paired with several dongles, but each dongle has one phone.
+The dongle keeps your password and beacon key in **RAM only** (firmware 1.3.0+),
+so it forgets them whenever it loses power. The phone therefore re-sends them
+**every time you plug the dongle in** — and the dongle's config window stays open
+until it has received them.
 
-A short tap (< 0.5 s) on the button ends the config window early. It also ends
-when the app disconnects, or after 60 s. Then the dongle starts scanning.
+1. Plug in the dongle. It opens its **config window** (blinking blue) and keeps it open until paired — there's no rush.
+2. In the app, set the green/blue thresholds (dBm). The first time, type your password (and, optionally, username 2 + password 2); it's saved on the phone, encrypted behind your fingerprint. After that, leave the fields blank to reuse the saved password.
+3. **Hold the dongle's button**, tap **Save & Send** (or **Unlock & Send** when reusing the saved password), and **confirm your fingerprint**. Writes are only accepted while the button is physically held — the proof that whoever is configuring the dongle owns it. This also **pairs** the dongle with your phone's beacon key. A dongle that isn't paired never sees any phone; one phone can be paired with several dongles, each with one phone.
 
-Credentials are **never stored on the phone**. The fields start blank and are
-cleared after a successful send. A blank field means "keep the dongle's current
-value". A checkbox removes username 2 and password 2 from the dongle.
+The window closes once the app has sent everything and disconnects, then the
+dongle starts scanning. It no longer times out into a blank state, and the
+button no longer ends it early — an unpaired dongle is useless, so it just waits.
+
+Your credentials are **stored on the phone, encrypted behind your fingerprint**
+(Android Keystore, a fresh fingerprint required for every save and send). They
+are never written to the dongle's flash — only held in its RAM while it's
+powered. Type a password to change the saved one; leave the fields blank to
+reuse it. A checkbox clears the saved username 2 + password 2.
 
 ---
 
@@ -139,33 +165,16 @@ value". A checkbox removes username 2 and password 2 from the dongle.
 | 0x00000–0x10000 | MCUboot (on the official dongle, the Nordic MBR is at 0x0 and MCUboot at 0x1000) |
 | 0x10000–0x76000 | Slot 0: running app |
 | 0x76000–0xDC000 | Slot 1: update upload target |
-| 0xDC000–0xE0000 | Saved config (raw flash record at 0xDC000) + beacon counter log (0xDD000, 0xDE000) |
+| 0xDC000–0xE0000 | Reserved, **unused since 1.3.0** (was the saved config + beacon counter log; config is RAM-only now) |
 | 0xE0000–0x100000 | Official dongle: Nordic bootloader (kept for last-resort recovery) |
 
 ### Flash wear
 
-The nRF52840's flash is rated for at least **10,000 erase cycles per 4 KB
-page**. Wear comes from erasing a page; appending a small write into
-already-erased space barely counts. The dongle writes flash in only three
-places:
-
-| What | When it writes | Typical rate |
-|---|---|---|
-| Saved settings (0xDC000) | Only when you save from the app: 1 erase + 1 write | A few times a year |
-| Beacon counter log (0xDD000 + 0xDE000) | One 4-byte entry per lock, plus one every 5 min while your phone is in range | ~100–300 entries/day |
-| Firmware slots | Only during a firmware update | A few times a year |
-
-The counter log is the only part written daily, and it is built to avoid
-wear:
-
-- Entries are appended into erased space. Each page holds 1,024 entries and is erased only when full, after which logging moves to the other page. One erase covers 1,024 entries, and the two pages share the erases.
-- Each word is written only once between erases.
-
-**Worst case:** the phone sits next to the dongle 24 hours a day. That's
-about 300 entries a day, so each page is erased about once a week (~54
-times a year). The flash would then last **10,000 ÷ 54 ≈ 185 years**. A
-normal office day (~150 entries) gives about **370 years**. Flash wear is
-not a practical limit.
+Not a concern. Since firmware 1.3.0 the dongle **writes flash only during a
+firmware update** (a few times a year) — the config and the beacon counter log
+that older versions wrote are gone (everything is held in RAM now). The
+nRF52840's flash is rated for at least 10,000 erase cycles per page, so this is
+nowhere near a practical limit.
 
 ---
 
@@ -247,7 +256,7 @@ debug access enabled. Use `--sectorerase` (not `--chiperase`) so UICR is preserv
 3. The app checks that the dongle's board matches the image. It then arms the update, uploads to slot 1 over SMP, and resets the dongle.
 4. MCUboot swaps the images (the LED is dark for ~15 s). The new firmware confirms itself at boot. If it crashes before that, MCUboot rolls back on the next reset.
 
-Settings survive updates from 1.2.0 on. The config record is versioned and only ever extended. Since 1.2.1 the dongle no longer loads records from before 1.2, which have no beacon key, so a dongle coming from older firmware has to be set up again.
+Since 1.3.0 the dongle stores no config at all (it's RAM-only, re-sent by the phone each boot), so after any update — or any power-cycle — just plug in, hold the button and send again from the app. On 1.2.x updates preserved the saved config; a dongle coming from before 1.2 has no beacon key and must be set up again.
 
 ---
 
@@ -264,7 +273,7 @@ adb install -r app\build\outputs\apk\release\app-release.apk
 
 - The build copies both boards' `dfu_application.zip` from `../build_*` into the APK. Build the firmware first; a missing image only gives a warning. Override the location with `-PfirmwareDir=...`.
 - Release signing reads `~/.android/ble_beacon_keystore.properties`, which you create yourself (`storeFile`, `storePassword`, `keyAlias`, `keyPassword`). Without it the release APK is unsigned. Debug builds work as usual.
-- Backups are disabled (`allowBackup=false`, plus data-extraction rules), and the app stores only the thresholds, its beacon counter, and its beacon key (encrypted under an Android Keystore key). Passwords are never stored.
+- Backups are disabled (`allowBackup=false`, plus data-extraction rules). The app stores the thresholds, its beacon counter, its beacon key (encrypted under an Android Keystore key), and your **passwords** — encrypted under a separate, **fingerprint-bound** Keystore key, with a fresh fingerprint required for every save and send. Reinstalling the app (or losing the signing key) wipes both Keystore keys, so you re-enter the passwords and re-pair every dongle.
 
 ---
 
@@ -283,7 +292,7 @@ Service `9f1b0001-5c3a-4e8e-9c2a-1a2b3c4d5e6f`. The dongle advertises as `BLE_Pa
 | `…0008` | Password 2 (UTF-8, empty = clear) | write* |
 | `…0009` | Username 2 (UTF-8, empty = clear) | write* |
 | `…000A` | Beacon key (16 bytes): pairs the dongle with a phone | write* |
-| `…000B` | Key ID (4 bytes; empty = not paired). The app sends the key only if this doesn't match. | read |
+| `…000B` | Key ID (4 bytes; empty = not paired). The app sends the key only if this doesn't match — and since the key is RAM-only (1.3.0+), after a power-cycle this reads empty, so the app re-sends it every boot. | read |
 | `…000C` | Session: read the dongle's ECDH public key, write the phone's (65-byte uncompressed P-256 points) | read / write |
 
 \* Accepted only during the config window **and while the button is held**.
@@ -292,20 +301,20 @@ the session (`seq[4] || ciphertext || tag[16]`, see `src/cfg_crypto.h`).
 
 In its config window the dongle advertises manufacturer data
 `FF FF 'B' 'P' 10 <flags>`, where bit 0 of flags means its button is held.
-Values are range-checked (−120…0 dBm, green > blue, non-empty password 1).
-The standard MCUmgr SMP service is also present, but it refuses all commands
-unless DFU has been armed.
+Thresholds are range-checked (−120…0 dBm, green > blue). The standard MCUmgr
+SMP service is also present, but it refuses all commands unless DFU has been
+armed.
 
 ---
 
 ## Security notes
 
-- **Passwords are write-only over BLE.** The password, username 2, password 2 and beacon-key characteristics accept writes only. The dongle has no way to read them back out over Bluetooth, not even for the paired phone or with the button held. The firmware-update service (SMP) handles only firmware images, not the config storage. The only way they ever leave the dongle is typed over USB: the password when you press the button, and the 5 s status dump. Both happen only while your phone is in the green zone.
-- Passwords are stored **unencrypted** in the dongle's flash. Anyone with the dongle and an SWD debugger (or the MDBT50Q's pads) can read them. Treat the dongle like a key.
+- **Nothing secret is stored on the dongle (firmware 1.3.0+).** The password, username 2, password 2 and beacon key live in the dongle's **RAM only** — never in its flash. Unplug the dongle and it holds nothing: pulling it apart with an SWD debugger (or the MDBT50Q's pads) finds no password. The phone re-sends the secrets each time you plug it in. This is the main reason 1.3.0 exists; before it, the password sat unencrypted in the dongle's flash and a lost dongle leaked it.
+- **Passwords are write-only over BLE.** The password, username 2, password 2 and beacon-key characteristics accept writes only. The dongle has no way to read them back out over Bluetooth, not even for the paired phone or with the button held. The firmware-update service (SMP) handles only firmware images. The only way a password ever leaves the dongle is typed over USB when you press the button, and only while your phone is in the green zone. The 5 s status dump shows just the first and last character.
+- **On the phone, your passwords are encrypted behind your fingerprint.** They're sealed with an Android Keystore key that requires a fresh biometric for every save and send, and that the hardware won't export — so even root can't read them at rest. (Root could still read them from app memory at the instant they're sent; that's inherent to a rooted device.)
 - Builds are signed with **NCS's default MCUboot development key**, which is public. Physical access (the button hold) is what protects updates. For anything serious, generate your own key and set `SB_CONFIG_BOOT_SIGNATURE_KEY_FILE`. After that, MCUboot must be reflashed once on every board.
-- The status dump only reveals credentials while the phone is in range.
 - The beacon can't be spoofed or replayed (see *Secure rolling beacon*). A **live relay** can still fake proximity. This is a convenience tool, not a hardened authenticator.
-- The secrets the app sends (passwords, username 2, and the beacon key on first pairing) are **encrypted**. Each connection runs a P-256 ECDH exchange, a fresh phone key against the dongle's per-window key, then derives two keys with HKDF-SHA256. Each secret write is encrypted and authenticated with HMAC-SHA256, bound to its characteristic, and numbered so it can't be replayed (`src/cfg_crypto.h`, `ConfigSession.kt`). The dongle refuses unencrypted secrets. A BLE sniffer sees only ciphertext. The exchange is *unauthenticated*, so an attacker actively relaying the connection during the 60 s window, while you hold the button, could still read it.
+- The secrets the app sends (passwords, username 2, and the beacon key) are **encrypted**. Each connection runs a P-256 ECDH exchange, a fresh phone key against the dongle's per-window key, then derives two keys with HKDF-SHA256. Each secret write is encrypted and authenticated with HMAC-SHA256, bound to its characteristic, and numbered so it can't be replayed (`src/cfg_crypto.h`, `ConfigSession.kt`). The dongle refuses unencrypted secrets, and a BLE sniffer sees only ciphertext. The exchange is *unauthenticated*, so an attacker actively relaying the connection while you hold the button could still read it — and because 1.3.0 re-sends the secrets on every plug-in, that window now recurs each time (a worthwhile future hardening is to authenticate the dongle to the app).
 
 ---
 

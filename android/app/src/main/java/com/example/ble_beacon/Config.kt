@@ -52,6 +52,7 @@ object Config {
     private const val PREFS = "ble_password_cfg"
     private const val KEY_GREEN = "green_threshold"
     private const val KEY_BLUE = "blue_threshold"
+    private const val KEY_BEACON_ON = "beacon_enabled"
 
     private fun prefs(ctx: Context) =
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -66,6 +67,13 @@ object Config {
 
     fun getBlueThresholdText(ctx: Context): String =
         if (prefs(ctx).contains(KEY_BLUE)) prefs(ctx).getInt(KEY_BLUE, 0).toString() else ""
+
+    /** Whether the user wants the beacon on (restored after a reboot / update). */
+    fun isBeaconEnabled(ctx: Context): Boolean = prefs(ctx).getBoolean(KEY_BEACON_ON, false)
+
+    fun setBeaconEnabled(ctx: Context, on: Boolean) {
+        prefs(ctx).edit { putBoolean(KEY_BEACON_ON, on) }
+    }
 
     /** Persist the non-secret settings (so the form shows them next time). */
     fun save(ctx: Context, green: Int, blue: Int) {

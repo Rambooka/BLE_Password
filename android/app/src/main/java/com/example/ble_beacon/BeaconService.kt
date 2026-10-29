@@ -2,6 +2,7 @@ package com.example.ble_beacon
 
 import android.annotation.SuppressLint
 import android.app.*
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertisingSet
@@ -12,6 +13,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.Handler
@@ -72,6 +74,7 @@ class BeaconService : Service() {
                     addAction(ACTION_TICK)
                     addAction(Intent.ACTION_SCREEN_ON)
                     addAction(Intent.ACTION_USER_PRESENT)
+                    addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
                 },
                 ContextCompat.RECEIVER_NOT_EXPORTED,
             )
@@ -109,9 +112,18 @@ class BeaconService : Service() {
         }
     }
 
-    // Alarm (works while the CPU sleeps) + screen on / unlock.
+    // Alarm (works while the CPU sleeps) + screen on / unlock tick the
+    // counter. Bluetooth being switched off kills the advertising set, so
+    // restart it when Bluetooth comes back on.
     private val wakeReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == BluetoothAdapter.ACTION_STATE_CHANGED) {
+                when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1)) {
+                    BluetoothAdapter.STATE_ON -> startAdvertising()
+                    BluetoothAdapter.STATE_OFF -> advertisingSet = null
+                }
+                return
+            }
             tick()
             if (intent.action == ACTION_TICK) scheduleAlarm()
         }
@@ -144,6 +156,9 @@ class BeaconService : Service() {
             Log.e(TAG, "Bluetooth not enabled or not supported")
             return
         }
+        // Drop any old set first, so a restart doesn't re-register the callback.
+        runCatching { advertiser?.stopAdvertisingSet(setCallback) }
+        advertisingSet = null
         advertiser = adapter.bluetoothLeAdvertiser ?: run {
             Log.e(TAG, "Bluetooth LE Advertising not supported")
             return
@@ -212,6 +227,16 @@ class BeaconService : Service() {
 
     companion object {
         const val CHANNEL_ID = "BeaconServiceChannel"
+
+        fun start(ctx: Context) {
+            ContextCompat.startForegroundService(ctx, Intent(ctx, BeaconService::class.java))
+        }
+
+        /** Advertising needs BLUETOOTH_ADVERTISE on Android 12+. */
+        fun hasPermissions(ctx: Context): Boolean =
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+                ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.BLUETOOTH_ADVERTISE) ==
+                PackageManager.PERMISSION_GRANTED
         private const val PREFS = "ble_password_beacon"
         private const val KEY_CTR = "last_counter"
         private const val SAVE_EVERY_TICKS = 60
